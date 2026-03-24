@@ -155,13 +155,18 @@ def send_file(
 
     channel = get_channel(channel_name)
 
-    # Determine chunk data size based on channel capacity
+    # Determine chunk data size.
+    # For high-capacity channels (e.g. ICMP 1472 bytes/pkt), size chunks to fit
+    # in a single packet (minus header overhead). For low-capacity channels
+    # (e.g. IP-ID 2 bytes/pkt), use a fixed chunk size — the channel's encode()
+    # will split the framed data into as many packets as needed.
     bytes_per_packet = channel.bits_per_packet // 8
-    # Account for fragmentation header (17 bytes) and length-prefix framing (4 bytes)
-    chunk_data_size = bytes_per_packet - 17 - 4
-    if chunk_data_size < 33:
-        console.print("[red]Error:[/red] Channel capacity too small for fragmentation overhead.")
-        sys.exit(1)
+    overhead = 17 + 4  # fragmentation header + length-prefix frame
+    if bytes_per_packet > overhead + 33:
+        chunk_data_size = bytes_per_packet - overhead
+    else:
+        # Small channel — use reasonable fixed chunk size
+        chunk_data_size = 128
 
     chunks = fragment(ciphertext, chunk_data_size)
     console.print(

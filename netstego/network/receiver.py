@@ -9,14 +9,13 @@ Handles the full receive pipeline:
 """
 
 import struct
-import sys
+import time as _time
 from pathlib import Path
 
 from rich.console import Console
 from scapy.sendrecv import AsyncSniffer
 from scapy.utils import rdpcap, wrpcap
 
-from netstego.channels.base import StegoChannel
 from netstego.core.crypto import decrypt, load_key
 from netstego.core.reassembly import Reassembler
 from netstego.network.sender import check_privileges, get_channel
@@ -48,24 +47,26 @@ def unframe_chunks(data: bytes) -> list[bytes]:
 
 
 def receive_file(
-    bind_ip: str,
+    sender_ip: str,
     key_path: Path,
     output_path: Path,
     channel_name: str,
     timeout: int = 60,
     pcap_out: Path | None = None,
     pcap_in: Path | None = None,
+    iface: str | None = None,
 ) -> bool:
     """Receive and reconstruct a file from a steganographic channel.
 
     Args:
-        bind_ip: IP address to listen on (used in BPF filter).
+        sender_ip: IP address of the sender (used in BPF filter as src host).
         key_path: Path to the AES-256 key file.
         output_path: Path to write the decrypted output file.
         channel_name: Name of the steganographic channel.
         timeout: Sniffing timeout in seconds.
         pcap_out: Optional path to save captured packets as PCAP.
         pcap_in: Optional PCAP file to read instead of sniffing.
+        iface: Optional network interface name for sniffing.
 
     Returns:
         True if file was successfully received and written.
@@ -84,20 +85,26 @@ def receive_file(
         all_packets = list(rdpcap(str(pcap_in)))
     else:
         # Sniff live traffic
-        bpf_filter = channel.protocol_filter.format(ip=bind_ip)
+        bpf_filter = channel.protocol_filter.format(ip=sender_ip)
         console.print(
-            f"[bold blue]Listening[/bold blue] on {bind_ip} "
+            f"[bold blue]Listening[/bold blue] for packets from [cyan]{sender_ip}[/cyan] "
             f"via [cyan]{channel.name}[/cyan] (timeout={timeout}s)"
         )
         console.print(f"[dim]BPF filter: {bpf_filter}[/dim]")
+        if iface:
+            console.print(f"[dim]Interface: {iface}[/dim]")
 
-        sniffer = AsyncSniffer(filter=bpf_filter, store=True)
+        sniffer_kwargs = {"filter": bpf_filter, "store": True}
+        if iface:
+            sniffer_kwargs["iface"] = iface
+
+        sniffer = AsyncSniffer(**sniffer_kwargs)
         sniffer.start()
 
         try:
-            sniffer.join(timeout=timeout)
+            _time.sleep(timeout)
         except KeyboardInterrupt:
-            console.print("[yellow]Interrupted by user[/yellow]")
+            console.print("\n[yellow]Interrupted by user[/yellow]")
         finally:
             sniffer.stop()
 

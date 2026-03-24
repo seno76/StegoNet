@@ -40,32 +40,35 @@ def send(file_path: str, channel: str, dest: str, key_file: str, rate: int, pcap
 
 @cli.command()
 @click.option("--channel", required=True, type=click.Choice(["ip-id", "tcp-isn", "icmp", "dns", "tcp-ts"]))
-@click.option("--bind", required=True, help="Bind IP address.")
+@click.option("--sender-ip", required=True, help="Sender's IP address (used in BPF filter).")
 @click.option("--key-file", required=True, type=click.Path(exists=True), help="Encryption key file.")
 @click.option("--output", required=True, type=click.Path(), help="Output file path.")
 @click.option("--timeout", default=60, type=int, help="Receive timeout in seconds.")
 @click.option("--pcap-out", default=None, type=click.Path(), help="Save captured packets to PCAP.")
 @click.option("--pcap-in", default=None, type=click.Path(exists=True), help="Read from PCAP instead of sniffing.")
+@click.option("--iface", default=None, help="Network interface for sniffing (e.g. eth0, Wi-Fi).")
 def receive(
     channel: str,
-    bind: str,
+    sender_ip: str,
     key_file: str,
     output: str,
     timeout: int,
     pcap_out: str | None,
     pcap_in: str | None,
+    iface: str | None,
 ) -> None:
     """Receive a file from a steganographic channel."""
     from netstego.network.receiver import receive_file
 
     success = receive_file(
-        bind_ip=bind,
+        sender_ip=sender_ip,
         key_path=Path(key_file),
         output_path=Path(output),
         channel_name=channel,
         timeout=timeout,
         pcap_out=Path(pcap_out) if pcap_out else None,
         pcap_in=Path(pcap_in) if pcap_in else None,
+        iface=iface,
     )
     if not success:
         raise SystemExit(1)
