@@ -1,0 +1,27 @@
+channel:
+  type: ip-id
+  bits_per_packet: 16
+
+crypto:
+  algorithm: aes-256-gcm
+  kdf: argon2id
+  argon2_time_cost: 3
+  argon2_memory_cost: 65536
+
+timing:
+  rate_pps: 10
+  jitter_factor: 0.1
+
+cover_traffic:
+  generate_noise: true
+  noise_ratio: 3
+
+detection:
+  chi_squared_alpha: 0.05
+  ipd_window: 100
+  ml_contamination: 0.05
+
+stats:
+  db_path: ~/.netstego/stats.db
+  realtime: true
+  flush_interval_sec: 5
