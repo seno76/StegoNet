@@ -1,0 +1,35 @@
+cd D:\Projects\DiplomaStegano
+
+REM 1. Генерация ключа -> скриншот demo_keygen.png
+python -m netstego keygen --output demo_key.bin
+
+REM 2. Отправка через ICMP -> скриншот demo_send_icmp.png
+REM    Вариант A: реальная отправка по сети (требует Npcap + права администратора)
+python -m netstego send --text "Secret message for NetStego demo" --channel icmp --dest 127.0.0.1 --key-file demo_key.bin --pcap-out demo_icmp.pcap --rate 10
+REM    Вариант B: без отправки по сети — только формирование пакетов и запись в PCAP (--dry-run)
+python -m netstego send --text "Secret message for NetStego demo" --channel icmp --dest 127.0.0.1 --key-file demo_key.bin --pcap-out demo_icmp.pcap --rate 10 --dry-run
+
+REM 3. Прием из PCAP -> скриншот demo_receive_icmp.png
+python -m netstego receive --channel icmp --sender-ip 127.0.0.1 --key-file demo_key.bin --output received.txt --pcap-in demo_icmp.pcap
+type received.txt
+
+REM 4. Отправка файла через DNS -> скриншот demo_send_dns.png
+echo Test data for DNS steganography > test_file.txt
+REM    Вариант A: реальная отправка по сети
+python -m netstego send --file test_file.txt --channel dns --dest 127.0.0.1 --key-file demo_key.bin --pcap-out demo_dns.pcap --rate 10
+REM    Вариант B: dry-run (без сети, только PCAP)
+python -m netstego send --file test_file.txt --channel dns --dest 127.0.0.1 --key-file demo_key.bin --pcap-out demo_dns.pcap --rate 10 --dry-run
+
+REM 5. Обнаружение ICMP -> скриншот demo_detect_icmp.png
+python -m netstego detect --input demo_icmp.pcap --report report_icmp.json
+
+REM 6. Обнаружение DNS -> скриншот demo_detect_dns.png
+python -m netstego detect --input demo_dns.pcap
+
+REM 7. Запуск тестов -> скриншот demo_pytest.png
+python -m pytest tests/ --tb=short -q
+
+REM 8. Wireshark -> скриншот demo_wireshark.png
+REM Открой demo_icmp.pcap в Wireshark, сделай скриншот списка пакетов
+
+REM Все скриншоты сохрани в diploma\images\

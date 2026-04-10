@@ -118,28 +118,33 @@ def frame_chunks(chunks: list[bytes]) -> bytes:
     return b"".join(parts)
 
 
-def send_file(
-    file_path: Path,
+def send_data(
+    data: bytes,
     dest_ip: str,
     key_path: Path,
     channel_name: str,
     timing: TimingConfig | None = None,
+    redundancy: int = 1,
     pcap_out: Path | None = None,
+    dry_run: bool = False,
 ) -> int:
-    """Encrypt, fragment, and send a file through a steganographic channel.
+    """Encrypt, fragment, and send data through a steganographic channel.
 
     Args:
-        file_path: Path to the file to send.
+        data: Raw plaintext bytes to send.
         dest_ip: Destination IP address.
         key_path: Path to the AES-256 key file.
         channel_name: Name of the steganographic channel.
         timing: Timing configuration (rate, jitter). Uses defaults if None.
+        redundancy: Number of times to send each chunk (for packet loss tolerance).
         pcap_out: Optional path to save sent packets as PCAP.
+        dry_run: If True, build packets and save PCAP without sending over network.
 
     Returns:
         Total number of packets sent.
     """
-    check_privileges()
+    if not dry_run:
+        check_privileges()
 
     if timing is None:
         timing = TimingConfig()
@@ -147,25 +152,18 @@ def send_file(
     key = load_key(key_path)
     console.print(f"[dim]Key loaded from {key_path}[/dim]")
 
-    plaintext = file_path.read_bytes()
-    console.print(f"[dim]File size: {len(plaintext)} bytes[/dim]")
+    console.print(f"[dim]Data size: {len(data)} bytes[/dim]")
 
-    ciphertext = encrypt(plaintext, key)
+    ciphertext = encrypt(data, key)
     console.print(f"[dim]Ciphertext size: {len(ciphertext)} bytes[/dim]")
 
     channel = get_channel(channel_name)
 
-    # Determine chunk data size.
-    # For high-capacity channels (e.g. ICMP 1472 bytes/pkt), size chunks to fit
-    # in a single packet (minus header overhead). For low-capacity channels
-    # (e.g. IP-ID 2 bytes/pkt), use a fixed chunk size — the channel's encode()
-    # will split the framed data into as many packets as needed.
     bytes_per_packet = channel.bits_per_packet // 8
     overhead = 17 + 4  # fragmentation header + length-prefix frame
     if bytes_per_packet > overhead + 33:
         chunk_data_size = bytes_per_packet - overhead
     else:
-        # Small channel — use reasonable fixed chunk size
         chunk_data_size = 128
 
     chunks = fragment(ciphertext, chunk_data_size)
@@ -174,7 +172,19 @@ def send_file(
         f"({chunk_data_size} data bytes/chunk)[/dim]"
     )
 
-    # Frame all chunks and encode as single stream
+    # Apply redundancy: repeat each chunk N times for packet loss tolerance.
+    if redundancy > 1:
+        redundant_chunks = []
+        for chunk in chunks:
+            for _ in range(redundancy):
+                redundant_chunks.append(chunk)
+        random.shuffle(redundant_chunks)
+        console.print(
+            f"[dim]Redundancy x{redundancy}: {len(redundant_chunks)} chunks "
+            f"({len(chunks)} unique)[/dim]"
+        )
+        chunks = redundant_chunks
+
     framed = frame_chunks(chunks)
     all_packets = channel.encode(framed, dest_ip)
 
@@ -187,12 +197,14 @@ def send_file(
     base_delay = 1.0 / timing.rate_pps if timing.rate_pps > 0 else 0.0
 
     with Progress(console=console) as progress:
-        task = progress.add_task("[green]Transmitting...", total=total_packets)
+        label = "[green]Building packets..." if dry_run else "[green]Transmitting..."
+        task = progress.add_task(label, total=total_packets)
         for pkt in all_packets:
-            scapy_send(pkt, verbose=False)
+            if not dry_run:
+                scapy_send(pkt, verbose=False)
             progress.advance(task)
 
-            if base_delay > 0:
+            if not dry_run and base_delay > 0:
                 jitter = random.uniform(
                     -timing.jitter_factor * base_delay,
                     timing.jitter_factor * base_delay,

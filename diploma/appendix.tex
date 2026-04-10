@@ -1,0 +1,2997 @@
+%%% appendix.tex — Приложения (полный исходный код системы NetStego)
+\newpage
+\section*{ПРИЛОЖЕНИЕ А. Модуль обнаружения стеганографических каналов}
+\addcontentsline{toc}{section}{ПРИЛОЖЕНИЕ А. Модуль обнаружения стеганографических каналов}
+
+Модуль \texttt{detection/analyzer.py} является центральным компонентом
+подсистемы обнаружения скрытых каналов. Оркестрирует работу статистических
+тестов, машинного обучения и сигнатурного анализа, вычисляет взвешенную
+оценку уверенности и формирует итоговый отчёт.
+
+\begin{lstlisting}[style=appendixcode]
+"""Detection orchestrator: combines statistical, ML, and signature methods.
+
+Analyzes PCAP files or live packet captures for signs of
+steganographic covert channels.
+"""
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from rich.console import Console
+from rich.table import Table
+from scapy.layers.dns import DNSQR
+from scapy.layers.inet import ICMP, IP, TCP
+from scapy.packet import Raw
+from scapy.utils import rdpcap
+
+from netstego.detection.ml_detector import (
+    MLResult, detect_isolation_forest, extract_features,
+)
+from netstego.detection.signatures import (
+    SignatureMatch, detect_signatures,
+)
+from netstego.detection.statistical import (
+    StatResult, chi_squared_uniformity, ipd_regularity,
+    ks_test_ipd, shannon_entropy,
+)
+
+console = Console()
+
+
+@dataclass
+class AnalysisReport:
+    """Complete analysis report."""
+
+    source: str
+    total_packets: int
+    statistical_results: list[StatResult] = field(
+        default_factory=list
+    )
+    ml_result: MLResult | None = None
+    signature_matches: list[SignatureMatch] = field(
+        default_factory=list
+    )
+    is_suspicious: bool = False
+    confidence: float = 0.0
+
+    def to_dict(self) -> dict:
+        """Serialize report to dictionary."""
+        proto_sigs = [
+            m for m in self.signature_matches
+            if m.field != "payload_content"
+        ]
+        content_sigs = [
+            m for m in self.signature_matches
+            if m.field == "payload_content"
+        ]
+        return {
+            "source": self.source,
+            "total_packets": self.total_packets,
+            "is_suspicious": self.is_suspicious,
+            "confidence": self.confidence,
+            "statistical": [
+                {
+                    "method": r.method,
+                    "metric": r.metric,
+                    "score": r.score,
+                    "p_value": r.p_value,
+                    "is_anomaly": r.is_anomaly,
+                    "details": r.details,
+                }
+                for r in self.statistical_results
+            ],
+            "ml": {
+                "method": self.ml_result.method,
+                "anomaly_ratio": self.ml_result.anomaly_ratio,
+                "is_anomaly": self.ml_result.is_anomaly,
+                "details": self.ml_result.details,
+            }
+            if self.ml_result
+            else None,
+            "signatures": [
+                {
+                    "packet_index": m.packet_index,
+                    "pattern": m.pattern,
+                    "confidence": m.confidence,
+                    "details": m.details,
+                }
+                for m in proto_sigs
+            ],
+            "content_analysis": [
+                {
+                    "packet_index": m.packet_index,
+                    "pattern": m.pattern,
+                    "confidence": m.confidence,
+                    "details": m.details,
+                }
+                for m in content_sigs
+            ],
+        }
+
+
+def _extract_packet_data(packets: list) -> dict:
+    """Extract field values, timestamps, and payloads from packets.
+
+    Returns dict with keys: ip_ids, tcp_seqs, timestamps,
+    payloads, ipds, sizes, tcp_tsvals, dns_qnames,
+    icmp_payload_sizes.
+    """
+    ip_ids = []
+    tcp_seqs = []
+    tcp_tsvals = []
+    dns_qnames = []
+    icmp_payload_sizes = []
+    timestamps = []
+    payloads = []
+    sizes = []
+
+    for pkt in packets:
+        if pkt.haslayer(IP):
+            ip_ids.append(pkt[IP].id)
+        if pkt.haslayer(TCP):
+            tcp_seqs.append(pkt[TCP].seq)
+            for opt_name, opt_val in pkt[TCP].options:
+                if opt_name == "Timestamp":
+                    tcp_tsvals.append(opt_val[0])
+                    break
+        if pkt.haslayer(DNSQR):
+            qname = pkt[DNSQR].qname
+            if isinstance(qname, bytes):
+                qname = qname.decode(
+                    "ascii", errors="ignore"
+                )
+            dns_qnames.append(qname.rstrip("."))
+        if pkt.haslayer(ICMP) and pkt.haslayer(Raw):
+            icmp_payload_sizes.append(
+                len(bytes(pkt[Raw].load))
+            )
+        ts = (
+            float(pkt.time)
+            if hasattr(pkt, "time")
+            else 0.0
+        )
+        timestamps.append(ts)
+        if pkt.haslayer(Raw):
+            payloads.append(bytes(pkt[Raw].load))
+        else:
+            payloads.append(b"")
+        sizes.append(len(pkt))
+
+    ipds = [
+        timestamps[i] - timestamps[i - 1]
+        for i in range(1, len(timestamps))
+    ]
+    return {
+        "ip_ids": ip_ids,
+        "tcp_seqs": tcp_seqs,
+        "tcp_tsvals": tcp_tsvals,
+        "dns_qnames": dns_qnames,
+        "icmp_payload_sizes": icmp_payload_sizes,
+        "timestamps": timestamps,
+        "payloads": payloads,
+        "ipds": ipds,
+        "sizes": sizes,
+    }
+
+
+def _ip_id_sequentiality(ip_ids: list[int]) -> StatResult:
+    """Check if IP ID values follow a sequential pattern.
+
+    Normal Windows traffic: IP ID increments by 1-3.
+    Stego: arbitrary values that break sequential patterns.
+    """
+    if len(ip_ids) < 3:
+        return StatResult(
+            method="ip_id_sequentiality",
+            metric="sequential_ratio",
+            score=0.0, p_value=None,
+            threshold=0.0, is_anomaly=False,
+            details="Insufficient data",
+        )
+    sequential_count = 0
+    for i in range(1, len(ip_ids)):
+        delta = (ip_ids[i] - ip_ids[i - 1]) % 65536
+        if 1 <= delta <= 10:
+            sequential_count += 1
+    ratio = sequential_count / (len(ip_ids) - 1)
+    threshold = 0.3
+    return StatResult(
+        method="ip_id_sequentiality",
+        metric="sequential_ratio",
+        score=ratio, p_value=None,
+        threshold=threshold,
+        is_anomaly=ratio < threshold,
+        details=(
+            f"sequential_pairs="
+            f"{sequential_count}/{len(ip_ids)-1}, "
+            f"ratio={ratio:.4f}"
+        ),
+    )
+
+
+def _tsval_monotonicity(
+    tsvals: list[int],
+) -> StatResult:
+    """Check if TCP TSval is monotonically increasing.
+
+    Normal: monotonic with consistent step.
+    Stego: arbitrary data breaking monotonicity.
+    """
+    violations = 0
+    for i in range(1, len(tsvals)):
+        if tsvals[i] <= tsvals[i - 1]:
+            violations += 1
+    ratio = (
+        violations / (len(tsvals) - 1)
+        if len(tsvals) > 1
+        else 0.0
+    )
+    threshold = 0.2
+    return StatResult(
+        method="tsval_monotonicity",
+        metric="violation_ratio",
+        score=ratio, p_value=None,
+        threshold=threshold,
+        is_anomaly=ratio > threshold,
+        details=(
+            f"violations={violations}/"
+            f"{len(tsvals)-1}, ratio={ratio:.4f}"
+        ),
+    )
+
+
+def _dns_qname_entropy(
+    qnames: list[str],
+) -> StatResult:
+    """Check entropy of DNS QNAME characters.
+
+    Normal DNS: readable names, low entropy (~3.5-4.0).
+    Base32 stego: random, high entropy (~4.5-5.0).
+    """
+    import math
+
+    all_chars = "".join(qnames)
+    if not all_chars:
+        return StatResult(
+            method="dns_qname_entropy",
+            metric="char_entropy",
+            score=0.0, p_value=None,
+            threshold=0.0, is_anomaly=False,
+            details="No data",
+        )
+    freq: dict[str, int] = {}
+    for c in all_chars:
+        freq[c] = freq.get(c, 0) + 1
+    n = len(all_chars)
+    entropy = -sum(
+        (cnt / n) * math.log2(cnt / n)
+        for cnt in freq.values()
+    )
+    avg_len = sum(len(q) for q in qnames) / len(qnames)
+    threshold_entropy = 4.3
+    threshold_len = 25
+    is_anomaly = (
+        entropy > threshold_entropy
+        and avg_len > threshold_len
+    )
+    return StatResult(
+        method="dns_qname_entropy",
+        metric="char_entropy",
+        score=entropy, p_value=None,
+        threshold=threshold_entropy,
+        is_anomaly=is_anomaly,
+        details=(
+            f"H={entropy:.4f}, "
+            f"avg_qname_len={avg_len:.1f}, "
+            f"unique_chars={len(freq)}"
+        ),
+    )
+
+
+def _icmp_payload_anomaly(
+    payload_sizes: list[int],
+) -> StatResult:
+    """Check if ICMP payload sizes are abnormal.
+
+    Normal ping: 32 bytes (Win) or 56 bytes (Linux).
+    Stego: often much larger (up to 1472 bytes).
+    """
+    avg_size = sum(payload_sizes) / len(payload_sizes)
+    max_size = max(payload_sizes)
+    threshold = 100
+    is_anomaly = avg_size > threshold
+    return StatResult(
+        method="icmp_payload_size",
+        metric="avg_payload_bytes",
+        score=avg_size, p_value=None,
+        threshold=float(threshold),
+        is_anomaly=is_anomaly,
+        details=(
+            f"avg={avg_size:.0f}, max={max_size}, "
+            f"count={len(payload_sizes)}"
+        ),
+    )
+
+
+def _payload_byte_entropy(
+    payloads: list[bytes],
+) -> StatResult:
+    """Check byte-level entropy of packet payloads.
+
+    Encrypted stego data: entropy close to 8.0 bits/byte.
+    Normal ICMP: repeating pattern, much lower entropy.
+    """
+    import math
+
+    all_bytes = b"".join(payloads)
+    if not all_bytes:
+        return StatResult(
+            method="payload_byte_entropy",
+            metric="bits_per_byte",
+            score=0.0, p_value=None,
+            threshold=0.0, is_anomaly=False,
+            details="No data",
+        )
+    freq = [0] * 256
+    for b in all_bytes:
+        freq[b] += 1
+    n = len(all_bytes)
+    entropy = -sum(
+        (f / n) * math.log2(f / n) for f in freq if f > 0
+    )
+    threshold = 7.0
+    return StatResult(
+        method="payload_byte_entropy",
+        metric="bits_per_byte",
+        score=entropy, p_value=None,
+        threshold=threshold,
+        is_anomaly=entropy > threshold,
+        details=(
+            f"H={entropy:.4f} bits/byte, "
+            f"total_bytes={n}"
+        ),
+    )
+
+
+def _detect_dns_stego_signatures(
+    qnames: list[str],
+) -> list:
+    """Detect stego patterns in DNS QNAME labels."""
+    import re
+    from netstego.detection.signatures import (
+        SignatureMatch,
+    )
+
+    matches = []
+    base32_pattern = re.compile(r"^[a-z2-7]{20,}$")
+    for i, qname in enumerate(qnames):
+        labels = qname.split(".")
+        for label in labels[:-2]:
+            if (
+                base32_pattern.match(label)
+                and len(label) > 20
+            ):
+                matches.append(SignatureMatch(
+                    packet_index=i,
+                    field="dns_qname",
+                    pattern="BASE32_SUBDOMAIN",
+                    confidence=0.85,
+                    details=(
+                        f"Base32-like label "
+                        f"({len(label)} chars): "
+                        f"{label[:30]}..."
+                    ),
+                ))
+                break
+        if any(l == "term" for l in labels):
+            matches.append(SignatureMatch(
+                packet_index=i,
+                field="dns_qname",
+                pattern="DNS_TERM_MARKER",
+                confidence=0.9,
+                details=(
+                    f"Termination marker "
+                    f"in QNAME: {qname}"
+                ),
+            ))
+    return matches
+
+
+def analyze_packets(
+    packets: list,
+    source: str = "unknown",
+    methods: list[str] | None = None,
+    alpha: float = 0.05,
+    ml_contamination: float = 0.05,
+) -> AnalysisReport:
+    """Run detection analysis on a list of packets.
+
+    Args:
+        packets: List of Scapy packets.
+        source: Source description (file path or iface).
+        methods: Methods to run: 'statistical',
+                 'ml', 'signatures'. Default: all.
+        alpha: Significance level for stat tests.
+        ml_contamination: IsolationForest parameter.
+
+    Returns:
+        AnalysisReport with all results.
+    """
+    if methods is None:
+        methods = ["statistical", "ml", "signatures"]
+
+    report = AnalysisReport(
+        source=source, total_packets=len(packets)
+    )
+    data = _extract_packet_data(packets)
+
+    # Statistical tests
+    if "statistical" in methods:
+        if (
+            data["ip_ids"]
+            and len(data["ip_ids"]) >= 10
+        ):
+            report.statistical_results.append(
+                _ip_id_sequentiality(data["ip_ids"])
+            )
+        if (
+            data["tcp_seqs"]
+            and len(data["tcp_seqs"]) >= 10
+        ):
+            report.statistical_results.append(
+                chi_squared_uniformity(
+                    data["tcp_seqs"], alpha
+                )
+            )
+        if data["ipds"]:
+            report.statistical_results.append(
+                ipd_regularity(data["ipds"])
+            )
+        if (
+            data["tcp_tsvals"]
+            and len(data["tcp_tsvals"]) >= 3
+        ):
+            report.statistical_results.append(
+                _tsval_monotonicity(data["tcp_tsvals"])
+            )
+        if (
+            data["dns_qnames"]
+            and len(data["dns_qnames"]) >= 3
+        ):
+            report.statistical_results.append(
+                _dns_qname_entropy(data["dns_qnames"])
+            )
+        if (
+            data["icmp_payload_sizes"]
+            and len(data["icmp_payload_sizes"]) >= 1
+        ):
+            report.statistical_results.append(
+                _icmp_payload_anomaly(
+                    data["icmp_payload_sizes"]
+                )
+            )
+        icmp_payloads = [
+            p for p in data["payloads"] if len(p) > 40
+        ]
+        if icmp_payloads:
+            report.statistical_results.append(
+                _payload_byte_entropy(icmp_payloads)
+            )
+
+    # ML detection
+    if "ml" in methods:
+        field_values = (
+            data["ip_ids"]
+            or data["tcp_seqs"]
+            or [0] * len(packets)
+        )
+        features = extract_features(
+            field_values, data["timestamps"],
+            data["sizes"], data["payloads"],
+        )
+        if len(features) >= 10:
+            report.ml_result = detect_isolation_forest(
+                features, ml_contamination
+            )
+
+    # Signature detection
+    if "signatures" in methods:
+        report.signature_matches = detect_signatures(
+            data["payloads"]
+        )
+        if data["dns_qnames"]:
+            report.signature_matches.extend(
+                _detect_dns_stego_signatures(
+                    data["dns_qnames"]
+                )
+            )
+
+    # Compute overall suspicion
+    import math as _math
+
+    valid_stats = [
+        r
+        for r in report.statistical_results
+        if "Insufficient" not in r.details
+        and "No data" not in r.details
+        and (
+            r.p_value is None
+            or not _math.isnan(r.p_value)
+        )
+        and "bins=1" not in r.details
+    ]
+    anomaly_count = sum(
+        1 for r in valid_stats if r.is_anomaly
+    )
+    total_tests = len(valid_stats)
+    stat_ratio = (
+        anomaly_count / total_tests
+        if total_tests > 0
+        else 0.0
+    )
+
+    strong_indicators = {
+        r.method for r in valid_stats if r.is_anomaly
+    } & {
+        "tsval_monotonicity",
+        "dns_qname_entropy",
+        "icmp_payload_size",
+        "payload_byte_entropy",
+        "ip_id_sequentiality",
+    }
+
+    ml_suspicious = (
+        report.ml_result.is_anomaly
+        if report.ml_result
+        else False
+    )
+    sig_count = len(report.signature_matches)
+
+    confidence = 0.0
+    if stat_ratio >= 0.5 or len(strong_indicators) >= 1:
+        confidence += 0.4
+    if ml_suspicious:
+        confidence += 0.3
+    if sig_count > 0:
+        confidence += 0.3
+
+    report.is_suspicious = confidence >= 0.4
+    report.confidence = confidence
+
+    return report
+
+
+def analyze_pcap(
+    pcap_path: Path,
+    methods: list[str] | None = None,
+    alpha: float = 0.05,
+    ml_contamination: float = 0.05,
+) -> AnalysisReport:
+    """Analyze a PCAP file for covert channels."""
+    packets = rdpcap(str(pcap_path))
+    return analyze_packets(
+        list(packets),
+        source=str(pcap_path),
+        methods=methods,
+        alpha=alpha,
+        ml_contamination=ml_contamination,
+    )
+
+
+def print_report(report: AnalysisReport) -> None:
+    """Print analysis report to console using rich."""
+    verdict = (
+        "[bold red]SUSPICIOUS[/bold red]"
+        if report.is_suspicious
+        else "[bold green]CLEAN[/bold green]"
+    )
+    console.print(f"\n{'='*60}")
+    console.print(
+        f"[bold]Detection Report:[/bold] "
+        f"{report.source}"
+    )
+    console.print(
+        f"Packets analyzed: {report.total_packets}"
+    )
+    console.print(
+        f"Verdict: {verdict} "
+        f"(confidence: {report.confidence:.0%})"
+    )
+    console.print(f"{'='*60}")
+
+    if report.statistical_results:
+        table = Table(title="Statistical Tests")
+        table.add_column("Method")
+        table.add_column("Metric")
+        table.add_column("Score")
+        table.add_column("P-value")
+        table.add_column("Anomaly")
+        for r in report.statistical_results:
+            style = "red" if r.is_anomaly else "green"
+            table.add_row(
+                r.method, r.metric,
+                f"{r.score:.4f}",
+                (
+                    f"{r.p_value:.6f}"
+                    if r.p_value is not None
+                    else "N/A"
+                ),
+                f"[{style}]"
+                f"{'YES' if r.is_anomaly else 'NO'}"
+                f"[/{style}]",
+            )
+        console.print(table)
+
+    if report.ml_result:
+        ml = report.ml_result
+        style = "red" if ml.is_anomaly else "green"
+        console.print(
+            f"\n[bold]ML Detection "
+            f"({ml.method}):[/bold]"
+        )
+        console.print(
+            f"  Anomaly ratio: "
+            f"[{style}]{ml.anomaly_ratio:.2%}"
+            f"[/{style}]"
+        )
+        console.print(f"  Details: {ml.details}")
+
+    proto_sigs = [
+        m for m in report.signature_matches
+        if m.field != "payload_content"
+    ]
+    content_sigs = [
+        m for m in report.signature_matches
+        if m.field == "payload_content"
+    ]
+    if proto_sigs:
+        console.print(
+            f"\n[bold red]Protocol signatures "
+            f"found: {len(proto_sigs)}[/bold red]"
+        )
+        for m in proto_sigs[:10]:
+            console.print(
+                f"  Packet #{m.packet_index}: "
+                f"{m.pattern} -- {m.details}"
+            )
+    if content_sigs:
+        console.print(
+            f"\n[bold red]Malicious content "
+            f"indicators: {len(content_sigs)}"
+            f"[/bold red]"
+        )
+        for m in content_sigs[:10]:
+            console.print(
+                f"  Packet #{m.packet_index}: "
+                f"[bold]{m.pattern}[/bold] "
+                f"(confidence: {m.confidence:.0%})"
+                f" -- {m.details}"
+            )
+\end{lstlisting}
+
+\newpage
+\section*{ПРИЛОЖЕНИЕ Б. Модули статистического анализа, машинного обучения и сигнатурного обнаружения}
+\addcontentsline{toc}{section}{ПРИЛОЖЕНИЕ Б. Модули статистического анализа, машинного обучения и сигнатурного обнаружения}
+
+\subsection*{Б.1 Статистические методы обнаружения (\texttt{detection/statistical.py})}
+
+Модуль реализует четыре статистических теста: критерий хи-квадрат
+для проверки равномерности распределения значений полей,
+критерий Колмогорова--Смирнова для анализа межпакетных задержек,
+вычисление энтропии Шеннона и анализ регулярности задержек.
+
+\begin{lstlisting}[style=appendixcode]
+"""Statistical detection methods for covert channel
+analysis.
+
+Implements:
+    - Chi-squared test for field value distributions
+    - Kolmogorov-Smirnov test for inter-packet delay
+    - Shannon entropy calculation
+    - Inter-packet delay analysis
+"""
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+from scipy import stats as sp_stats
+
+
+@dataclass
+class StatResult:
+    """Result of a statistical test."""
+
+    method: str
+    metric: str
+    score: float
+    p_value: float | None
+    threshold: float
+    is_anomaly: bool
+    details: str = ""
+
+
+def chi_squared_uniformity(
+    values: list[int], alpha: float = 0.05,
+) -> StatResult:
+    """Chi-squared test for uniformity of field values.
+
+    Tests whether the distribution of values deviates
+    significantly from a uniform distribution, which
+    may indicate steganographic encoding.
+    """
+    if len(values) < 10:
+        return StatResult(
+            method="chi_squared",
+            metric="uniformity",
+            score=0.0, p_value=1.0,
+            threshold=alpha, is_anomaly=False,
+            details="Insufficient data (< 10 samples)",
+        )
+
+    arr = np.array(values)
+    n_bins = min(256, len(set(values)))
+    observed, bin_edges = np.histogram(
+        arr, bins=n_bins
+    )
+    expected = np.full_like(
+        observed,
+        fill_value=len(values) / n_bins,
+        dtype=float,
+    )
+    chi2, p_value = sp_stats.chisquare(
+        observed, f_exp=expected
+    )
+    return StatResult(
+        method="chi_squared",
+        metric="uniformity",
+        score=float(chi2),
+        p_value=float(p_value),
+        threshold=alpha,
+        is_anomaly=p_value < alpha,
+        details=(
+            f"chi2={chi2:.4f}, p={p_value:.6f}, "
+            f"bins={n_bins}"
+        ),
+    )
+
+
+def ks_test_ipd(
+    delays: list[float], alpha: float = 0.05,
+) -> StatResult:
+    """Kolmogorov-Smirnov test for IPD distribution.
+
+    Tests whether IPD follows an exponential
+    distribution (typical for normal traffic).
+    Steganographic traffic has more regular timing.
+    """
+    if len(delays) < 10:
+        return StatResult(
+            method="ks_test",
+            metric="ipd_distribution",
+            score=0.0, p_value=1.0,
+            threshold=alpha, is_anomaly=False,
+            details="Insufficient data (< 10 samples)",
+        )
+
+    arr = np.array(delays)
+    arr = arr[arr > 0]
+    if len(arr) < 5:
+        return StatResult(
+            method="ks_test",
+            metric="ipd_distribution",
+            score=0.0, p_value=1.0,
+            threshold=alpha, is_anomaly=False,
+            details="Insufficient positive delays",
+        )
+
+    mean_delay = float(np.mean(arr))
+    stat, p_value = sp_stats.kstest(
+        arr, "expon", args=(0, mean_delay)
+    )
+    return StatResult(
+        method="ks_test",
+        metric="ipd_distribution",
+        score=float(stat),
+        p_value=float(p_value),
+        threshold=alpha,
+        is_anomaly=p_value < alpha,
+        details=(
+            f"D={stat:.4f}, p={p_value:.6f}, "
+            f"mean_ipd={mean_delay:.4f}s"
+        ),
+    )
+
+
+def shannon_entropy(
+    values: list[int],
+) -> StatResult:
+    """Calculate Shannon entropy of field values.
+
+    High entropy close to theoretical maximum may
+    indicate steganographic encoding.
+    """
+    if not values:
+        return StatResult(
+            method="entropy",
+            metric="shannon",
+            score=0.0, p_value=None,
+            threshold=0.0, is_anomaly=False,
+            details="No data",
+        )
+
+    n = len(values)
+    freq: dict[int, int] = {}
+    for v in values:
+        freq[v] = freq.get(v, 0) + 1
+
+    entropy = 0.0
+    for count in freq.values():
+        p = count / n
+        if p > 0:
+            entropy -= p * math.log2(p)
+
+    max_entropy = math.log2(n) if n > 1 else 1.0
+    normalized = (
+        entropy / max_entropy
+        if max_entropy > 0
+        else 0.0
+    )
+    threshold = 0.95
+    return StatResult(
+        method="entropy",
+        metric="shannon",
+        score=normalized,
+        p_value=None,
+        threshold=threshold,
+        is_anomaly=normalized > threshold,
+        details=(
+            f"H={entropy:.4f} bits, "
+            f"normalized={normalized:.4f}, "
+            f"unique={len(freq)}"
+        ),
+    )
+
+
+def ipd_regularity(
+    delays: list[float],
+) -> StatResult:
+    """Measure regularity of inter-packet delays.
+
+    Low coefficient of variation (CV) suggests
+    artificially timed traffic.
+    """
+    if len(delays) < 5:
+        return StatResult(
+            method="ipd_regularity",
+            metric="coefficient_of_variation",
+            score=0.0, p_value=None,
+            threshold=0.0, is_anomaly=False,
+            details="Insufficient data",
+        )
+
+    arr = np.array(delays)
+    mean = float(np.mean(arr))
+    std = float(np.std(arr))
+    cv = std / mean if mean > 0 else 0.0
+
+    threshold = 0.1
+    return StatResult(
+        method="ipd_regularity",
+        metric="coefficient_of_variation",
+        score=cv, p_value=None,
+        threshold=threshold,
+        is_anomaly=cv < threshold,
+        details=(
+            f"CV={cv:.4f}, mean={mean:.4f}s, "
+            f"std={std:.4f}s"
+        ),
+    )
+\end{lstlisting}
+
+\newpage
+\subsection*{Б.2 Обнаружение на основе машинного обучения}
+\noindent Модуль \texttt{detection/ml\_detector.py}
+
+Модуль реализует два метода обнаружения на основе машинного обучения:
+Isolation Forest (обучение без учителя) и Random Forest (обучение
+с учителем). Извлекает 9-мерный вектор признаков из пакетных данных.
+
+\begin{lstlisting}[style=appendixcode]
+"""Machine learning based covert channel detection.
+
+Uses IsolationForest for anomaly detection on packet
+features. Can optionally train a RandomForest classifier
+if labeled data is available.
+"""
+
+from dataclasses import dataclass
+
+import numpy as np
+from sklearn.ensemble import (
+    IsolationForest, RandomForestClassifier,
+)
+from sklearn.preprocessing import StandardScaler
+
+
+@dataclass
+class MLResult:
+    """Result of ML-based detection."""
+
+    method: str
+    anomaly_ratio: float
+    predictions: list[int]
+    confidence: float
+    is_anomaly: bool
+    details: str = ""
+
+
+def _byte_entropy(data: bytes) -> float:
+    """Shannon entropy of byte values (0-8 bits/byte)."""
+    if not data:
+        return 0.0
+    freq = [0] * 256
+    for b in data:
+        freq[b] += 1
+    n = len(data)
+    import math
+    return -sum(
+        (f / n) * math.log2(f / n)
+        for f in freq
+        if f > 0
+    )
+
+
+def extract_features(
+    field_values: list[int],
+    timestamps: list[float],
+    packet_sizes: list[int] | None = None,
+    payloads: list[bytes] | None = None,
+) -> np.ndarray:
+    """Extract feature vectors from packet data.
+
+    Features per packet (sliding window of 5):
+        - Field value
+        - Delta from previous value
+        - Inter-packet delay
+        - Packet size
+        - Rolling mean of field values
+        - Rolling std of field values
+        - Rolling mean of IPD
+        - Payload byte entropy (0-8 bits/byte)
+        - Payload length
+
+    Returns:
+        2D numpy array of shape (n_samples, 9).
+    """
+    n = len(field_values)
+    if n < 2:
+        return np.empty((0, 9))
+
+    values = np.array(field_values, dtype=float)
+    times = np.array(timestamps, dtype=float)
+    sizes = (
+        np.array(packet_sizes, dtype=float)
+        if packet_sizes
+        else np.zeros(n)
+    )
+
+    if payloads and len(payloads) == n:
+        payload_entropies = np.array(
+            [_byte_entropy(p) for p in payloads]
+        )
+        payload_lengths = np.array(
+            [len(p) for p in payloads], dtype=float
+        )
+    else:
+        payload_entropies = np.zeros(n)
+        payload_lengths = np.zeros(n)
+
+    value_deltas = np.diff(values, prepend=values[0])
+    ipd = np.diff(times, prepend=times[0])
+
+    window = min(5, n)
+    features = []
+    for i in range(n):
+        start = max(0, i - window + 1)
+        win_vals = values[start : i + 1]
+        win_ipd = ipd[start : i + 1]
+        features.append([
+            values[i],
+            value_deltas[i],
+            ipd[i],
+            sizes[i],
+            float(np.mean(win_vals)),
+            float(np.std(win_vals)),
+            float(np.mean(win_ipd)),
+            payload_entropies[i],
+            payload_lengths[i],
+        ])
+
+    return np.array(features)
+
+
+def detect_isolation_forest(
+    features: np.ndarray,
+    contamination: float = 0.05,
+) -> MLResult:
+    """Run IsolationForest anomaly detection."""
+    if len(features) < 10:
+        return MLResult(
+            method="isolation_forest",
+            anomaly_ratio=0.0, predictions=[],
+            confidence=0.0, is_anomaly=False,
+            details="Insufficient data (< 10 samples)",
+        )
+
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(features)
+
+    clf = IsolationForest(
+        contamination=contamination,
+        random_state=42,
+        n_estimators=100,
+    )
+    predictions = clf.fit_predict(scaled)
+    scores = clf.decision_function(scaled)
+
+    anomaly_count = int(np.sum(predictions == -1))
+    anomaly_ratio = anomaly_count / len(predictions)
+    mean_score = float(np.mean(scores))
+
+    return MLResult(
+        method="isolation_forest",
+        anomaly_ratio=anomaly_ratio,
+        predictions=predictions.tolist(),
+        confidence=abs(mean_score),
+        is_anomaly=anomaly_ratio > contamination * 2,
+        details=(
+            f"anomalies={anomaly_count}/"
+            f"{len(predictions)}, "
+            f"ratio={anomaly_ratio:.4f}, "
+            f"mean_score={mean_score:.4f}"
+        ),
+    )
+
+
+def train_classifier(
+    features: np.ndarray,
+    labels: np.ndarray,
+) -> tuple[RandomForestClassifier, StandardScaler]:
+    """Train a RandomForest classifier on labeled data.
+
+    Returns:
+        Tuple of (trained classifier, fitted scaler).
+    """
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(features)
+
+    clf = RandomForestClassifier(
+        n_estimators=100,
+        random_state=42,
+        max_depth=10,
+    )
+    clf.fit(scaled, labels)
+    return clf, scaler
+
+
+def detect_random_forest(
+    train_features: np.ndarray,
+    train_labels: np.ndarray,
+    test_features: np.ndarray,
+    test_labels: np.ndarray | None = None,
+) -> MLResult:
+    """Run supervised RandomForest detection.
+
+    Trains on labeled normal/stego data and predicts
+    test samples.
+    """
+    if (
+        len(train_features) < 10
+        or len(test_features) < 2
+    ):
+        return MLResult(
+            method="random_forest",
+            anomaly_ratio=0.0, predictions=[],
+            confidence=0.0, is_anomaly=False,
+            details=(
+                "Insufficient data for supervised "
+                "classification"
+            ),
+        )
+
+    clf, scaler = train_classifier(
+        train_features, train_labels
+    )
+    scaled_test = scaler.transform(test_features)
+    predictions = clf.predict(scaled_test)
+    probabilities = clf.predict_proba(scaled_test)
+
+    stego_count = int(np.sum(predictions == 1))
+    stego_ratio = (
+        stego_count / len(predictions)
+        if len(predictions) > 0
+        else 0.0
+    )
+    avg_confidence = float(
+        np.mean(np.max(probabilities, axis=1))
+    )
+
+    details_parts = [
+        f"stego={stego_count}/{len(predictions)}",
+        f"ratio={stego_ratio:.4f}",
+        f"avg_confidence={avg_confidence:.4f}",
+    ]
+
+    if (
+        test_labels is not None
+        and len(test_labels) == len(predictions)
+    ):
+        accuracy = float(
+            np.mean(predictions == test_labels)
+        )
+        details_parts.append(
+            f"accuracy={accuracy:.4f}"
+        )
+
+    return MLResult(
+        method="random_forest",
+        anomaly_ratio=stego_ratio,
+        predictions=predictions.tolist(),
+        confidence=avg_confidence,
+        is_anomaly=stego_ratio > 0.3,
+        details=", ".join(details_parts),
+    )
+\end{lstlisting}
+
+\newpage
+\subsection*{Б.3 Сигнатурный анализ и обнаружение вредоносных вложений}
+\noindent Модуль \texttt{detection/signatures.py}
+
+Модуль реализует сигнатурный анализ пакетов: обнаружение маркера
+протокола NST, анализ паттернов длины и проверку содержимого
+извлечённых данных на наличие вредоносных вложений (20~сигнатур
+в~7~категориях).
+
+\begin{lstlisting}[style=appendixcode]
+"""Signature-based detection for NetStego's internal
+protocol.
+
+Scans packet payloads and field patterns for the NST
+magic header and other markers of the steganographic
+protocol.
+"""
+
+from dataclasses import dataclass
+
+from netstego.core.fragmentation import MAGIC
+
+
+@dataclass
+class SignatureMatch:
+    """A detected signature match."""
+
+    packet_index: int
+    field: str
+    pattern: str
+    confidence: float
+    details: str = ""
+
+
+def scan_for_magic(
+    payloads: list[bytes],
+) -> list[SignatureMatch]:
+    """Scan packet payloads for NST magic bytes."""
+    matches = []
+    for i, payload in enumerate(payloads):
+        idx = payload.find(MAGIC)
+        if idx != -1:
+            matches.append(SignatureMatch(
+                packet_index=i,
+                field="payload",
+                pattern="NST_MAGIC",
+                confidence=1.0,
+                details=(
+                    f"Magic 'NST\\x00' at offset {idx}"
+                ),
+            ))
+    return matches
+
+
+def scan_for_length_prefix_pattern(
+    payloads: list[bytes],
+) -> list[SignatureMatch]:
+    """Detect 4-byte length prefix framing pattern.
+
+    Checks if payloads start with a plausible 4-byte
+    big-endian length followed by data of matching size.
+    """
+    import struct
+
+    matches = []
+    for i, payload in enumerate(payloads):
+        if len(payload) < 4:
+            continue
+        claimed_len = struct.unpack(
+            ">I", payload[:4]
+        )[0]
+        if 17 <= claimed_len <= len(payload) - 4:
+            data_after = payload[4 : 4 + claimed_len]
+            if data_after[:4] == MAGIC:
+                matches.append(SignatureMatch(
+                    packet_index=i,
+                    field="payload",
+                    pattern="LENGTH_PREFIX_MAGIC",
+                    confidence=0.95,
+                    details=(
+                        f"Length prefix {claimed_len} "
+                        f"followed by NST magic"
+                    ),
+                ))
+    return matches
+
+
+# Known malicious content signatures
+_CONTENT_SIGNATURES: list[
+    tuple[bytes, str, str, float]
+] = [
+    # (pattern, name, description, confidence)
+    (b"MZ", "PE_HEADER",
+     "Windows PE executable (MZ header)", 0.9),
+    (b"\x7fELF", "ELF_HEADER",
+     "Linux ELF executable", 0.95),
+    (b"#!/bin/", "SHEBANG_SCRIPT",
+     "Unix shell script (shebang)", 0.8),
+    (b"#!/usr/bin/", "SHEBANG_SCRIPT",
+     "Unix shell script (shebang)", 0.8),
+    (b"<script", "HTML_SCRIPT",
+     "Embedded HTML/JavaScript", 0.75),
+    (b"powershell", "POWERSHELL_CMD",
+     "PowerShell command", 0.8),
+    (b"cmd /c", "CMD_EXEC",
+     "Windows cmd execution", 0.8),
+    (b"cmd.exe", "CMD_EXEC",
+     "Windows cmd.exe reference", 0.75),
+    (b"\x90\x90\x90\x90\x90\x90\x90\x90",
+     "NOP_SLED",
+     "NOP sled (possible shellcode)", 0.85),
+    (b"\xcc\xcc\xcc\xcc", "INT3_SLED",
+     "INT3 breakpoint sled", 0.8),
+    (b"PK\x03\x04", "ZIP_ARCHIVE",
+     "ZIP archive (may contain executables)", 0.6),
+    (b"\x1f\x8b", "GZIP_ARCHIVE",
+     "GZIP compressed data", 0.5),
+    (b"Rar!\x1a\x07", "RAR_ARCHIVE",
+     "RAR archive", 0.6),
+    (b"\xd0\xcf\x11\xe0", "OLE_DOCUMENT",
+     "OLE2 document (Office macro capable)", 0.7),
+    (b"%PDF", "PDF_DOCUMENT",
+     "PDF document (may contain JS)", 0.5),
+    (b"import os", "PYTHON_IMPORT",
+     "Python code with OS access", 0.65),
+    (b"import subprocess", "PYTHON_SUBPROCESS",
+     "Python code with subprocess", 0.75),
+    (b"eval(", "EVAL_CALL",
+     "Dynamic code evaluation", 0.7),
+    (b"exec(", "EXEC_CALL",
+     "Dynamic code execution", 0.7),
+    (b"base64.b64decode", "BASE64_DECODE",
+     "Base64 decoding (obfuscation)", 0.6),
+]
+
+
+def scan_payload_content(
+    payloads: list[bytes],
+) -> list[SignatureMatch]:
+    """Analyze extracted payloads for signs of malicious
+    content.
+
+    Scans reassembled data for executable headers,
+    scripts, shellcode patterns, and other indicators
+    of malicious attachments hidden via steganographic
+    channels.
+    """
+    matches = []
+    for i, payload in enumerate(payloads):
+        if len(payload) < 2:
+            continue
+        for pattern, name, desc, conf in (
+            _CONTENT_SIGNATURES
+        ):
+            idx = payload.find(pattern)
+            if idx != -1:
+                matches.append(SignatureMatch(
+                    packet_index=i,
+                    field="payload_content",
+                    pattern=name,
+                    confidence=conf,
+                    details=f"{desc} at offset {idx}",
+                ))
+    return matches
+
+
+def detect_signatures(
+    payloads: list[bytes],
+) -> list[SignatureMatch]:
+    """Run all signature detection methods."""
+    matches = []
+    matches.extend(scan_for_magic(payloads))
+    matches.extend(
+        scan_for_length_prefix_pattern(payloads)
+    )
+    matches.extend(scan_payload_content(payloads))
+    return matches
+\end{lstlisting}
+
+\newpage
+\section*{ПРИЛОЖЕНИЕ В. Криптографическое ядро и протокол фрагментации}
+\addcontentsline{toc}{section}{ПРИЛОЖЕНИЕ В. Криптографическое ядро и протокол фрагментации}
+
+\subsection*{В.1 Модуль шифрования (\texttt{core/crypto.py})}
+
+Модуль реализует криптографические операции: генерацию и загрузку ключей,
+деривацию ключа из пароля (Argon2id), шифрование и расшифрование
+данных алгоритмом AES-256-GCM.
+
+\begin{lstlisting}[style=appendixcode]
+"""Cryptographic operations: AES-256-GCM encryption
+with Argon2id KDF.
+
+References:
+    - AES-GCM: NIST SP 800-38D
+    - Argon2id: RFC 9106
+"""
+
+import secrets
+from pathlib import Path
+
+from argon2.low_level import Type, hash_secret_raw
+from cryptography.hazmat.primitives.ciphers.aead import (
+    AESGCM,
+)
+
+KEY_SIZE = 32
+NONCE_SIZE = 12
+SALT_SIZE = 16
+
+
+def generate_key(path: Path) -> bytes:
+    """Generate a random 256-bit key and save to file."""
+    key = secrets.token_bytes(KEY_SIZE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(key)
+    return key
+
+
+def load_key(path: Path) -> bytes:
+    """Load a key from file.
+
+    Raises:
+        ValueError: If key file has wrong size.
+    """
+    data = path.read_bytes()
+    if len(data) != KEY_SIZE:
+        msg = (
+            f"Key file must be {KEY_SIZE} bytes, "
+            f"got {len(data)}"
+        )
+        raise ValueError(msg)
+    return data
+
+
+def derive_key(
+    password: bytes,
+    salt: bytes | None = None,
+    *,
+    time_cost: int = 3,
+    memory_cost: int = 65536,
+) -> tuple[bytes, bytes]:
+    """Derive AES-256 key from password using Argon2id.
+
+    Args:
+        password: Password or passphrase bytes.
+        salt: Optional salt; generated if not provided.
+        time_cost: Argon2 time cost parameter.
+        memory_cost: Argon2 memory cost in KiB.
+
+    Returns:
+        Tuple of (derived_key, salt).
+    """
+    if salt is None:
+        salt = secrets.token_bytes(SALT_SIZE)
+    key = hash_secret_raw(
+        secret=password,
+        salt=salt,
+        time_cost=time_cost,
+        memory_cost=memory_cost,
+        parallelism=1,
+        hash_len=KEY_SIZE,
+        type=Type.ID,
+    )
+    return key, salt
+
+
+def encrypt(plaintext: bytes, key: bytes) -> bytes:
+    """Encrypt data with AES-256-GCM.
+
+    Output: nonce (12 B) || ciphertext || tag (16 B)
+    """
+    nonce = secrets.token_bytes(NONCE_SIZE)
+    aesgcm = AESGCM(key)
+    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+    return nonce + ciphertext
+
+
+def decrypt(data: bytes, key: bytes) -> bytes:
+    """Decrypt AES-256-GCM encrypted data.
+
+    Expects: nonce (12 B) || ciphertext || tag (16 B)
+
+    Raises:
+        ValueError: If data is too short.
+        InvalidTag: If authentication fails.
+    """
+    if len(data) < NONCE_SIZE + 16:
+        msg = "Encrypted data too short"
+        raise ValueError(msg)
+    nonce = data[:NONCE_SIZE]
+    ciphertext = data[NONCE_SIZE:]
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, ciphertext, None)
+\end{lstlisting}
+
+\newpage
+\subsection*{В.2 Модуль фрагментации (\texttt{core/fragmentation.py})}
+
+Модуль реализует протокол фрагментации NST с 17-байтным заголовком чанка,
+включающим магическое число, порядковый номер, общее число чанков,
+контрольную сумму CRC32 и флаги.
+
+\begin{lstlisting}[style=appendixcode]
+"""Payload fragmentation with internal chunk header.
+
+Chunk header format (17 bytes):
+    Offset  Size    Field
+    0       4       MAGIC: b"NST\x00"
+    4       4       SEQ NUMBER (uint32 BE)
+    8       4       TOTAL CHUNKS (uint32 BE)
+    12      4       CRC32 (uint32 BE) of DATA only
+    16      1       FLAGS (uint8)
+    17      N       DATA
+
+Flags:
+    0x01 -- first chunk (DATA starts with SHA-256)
+    0x02 -- last chunk
+    0x04 -- NACK (retransmit request)
+"""
+
+import hashlib
+import struct
+import zlib
+
+MAGIC = b"NST\x00"
+HEADER_SIZE = 17
+
+FLAG_FIRST = 0x01
+FLAG_LAST = 0x02
+FLAG_NACK = 0x04
+
+
+def _make_header(
+    seq: int, total: int, crc: int, flags: int,
+) -> bytes:
+    """Build a 17-byte chunk header."""
+    return struct.pack(
+        ">4sIIIB", MAGIC, seq, total, crc, flags
+    )
+
+
+def parse_header(
+    chunk: bytes,
+) -> tuple[int, int, int, int, bytes]:
+    """Parse a chunk into (seq, total, crc32, flags, data).
+
+    Raises:
+        ValueError: If magic bytes wrong or chunk short.
+    """
+    if len(chunk) < HEADER_SIZE:
+        msg = (
+            f"Chunk too short: "
+            f"{len(chunk)} < {HEADER_SIZE}"
+        )
+        raise ValueError(msg)
+    magic, seq, total, crc, flags = struct.unpack(
+        ">4sIIIB", chunk[:HEADER_SIZE]
+    )
+    if magic != MAGIC:
+        msg = f"Invalid magic: {magic!r}"
+        raise ValueError(msg)
+    data = chunk[HEADER_SIZE:]
+    return seq, total, crc, flags, data
+
+
+def fragment(
+    payload: bytes, chunk_size: int,
+) -> list[bytes]:
+    """Split payload into chunks with headers.
+
+    The first chunk includes the SHA-256 hash of the
+    original payload prepended to the data (32 bytes).
+
+    Args:
+        payload: Data to fragment.
+        chunk_size: Max data bytes per chunk (excl. hdr).
+
+    Raises:
+        ValueError: If chunk_size < 33.
+    """
+    if chunk_size < 33:
+        msg = (
+            "chunk_size must be >= 33 to fit "
+            "SHA-256 hash in first chunk"
+        )
+        raise ValueError(msg)
+
+    sha256 = hashlib.sha256(payload).digest()
+
+    first_data_limit = chunk_size - 32
+    pieces: list[bytes] = []
+
+    if len(payload) <= first_data_limit:
+        pieces.append(sha256 + payload)
+    else:
+        pieces.append(
+            sha256 + payload[:first_data_limit]
+        )
+        remaining = payload[first_data_limit:]
+        while remaining:
+            pieces.append(remaining[:chunk_size])
+            remaining = remaining[chunk_size:]
+
+    total = len(pieces)
+    chunks: list[bytes] = []
+
+    for i, data in enumerate(pieces):
+        flags = 0
+        if i == 0:
+            flags |= FLAG_FIRST
+        if i == total - 1:
+            flags |= FLAG_LAST
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        header = _make_header(
+            seq=i, total=total, crc=crc, flags=flags
+        )
+        chunks.append(header + data)
+
+    return chunks
+\end{lstlisting}
+
+\newpage
+\subsection*{В.3 Модуль реассемблирования (\texttt{core/reassembly.py})}
+
+Модуль реализует сборку фрагментированных данных с поддержкой
+получения чанков в произвольном порядке, дедупликацией избыточных
+копий, проверкой CRC32 каждого чанка и верификацией SHA-256
+собранного файла.
+
+\begin{lstlisting}[style=appendixcode]
+"""Chunk reassembly with out-of-order support and
+integrity verification.
+
+Collects fragmented chunks, reorders by sequence
+number, verifies CRC32 per chunk and SHA-256 of
+the full payload.
+"""
+
+import hashlib
+import zlib
+
+from netstego.core.fragmentation import (
+    FLAG_FIRST, FLAG_LAST, parse_header,
+)
+
+
+class ReassemblyError(Exception):
+    """Raised when reassembly fails."""
+
+
+class Reassembler:
+    """Collects chunks and reassembles the original
+    payload. Supports out-of-order delivery."""
+
+    def __init__(self) -> None:
+        self._chunks: dict[int, tuple[int, bytes]] = {}
+        self._total: int | None = None
+        self._duplicates: int = 0
+
+    @property
+    def received_count(self) -> int:
+        """Number of unique chunks received."""
+        return len(self._chunks)
+
+    @property
+    def total_expected(self) -> int | None:
+        """Total chunks expected, or None if unknown."""
+        return self._total
+
+    @property
+    def missing_seqs(self) -> list[int]:
+        """List of missing sequence numbers."""
+        if self._total is None:
+            return []
+        return [
+            i for i in range(self._total)
+            if i not in self._chunks
+        ]
+
+    @property
+    def duplicates_received(self) -> int:
+        """Number of duplicate chunks discarded."""
+        return self._duplicates
+
+    def add_chunk(self, raw_chunk: bytes) -> int:
+        """Parse and store a chunk.
+
+        Duplicate chunks are silently ignored, enabling
+        redundancy-based packet loss tolerance.
+
+        Raises:
+            ValueError: If chunk is malformed.
+            ReassemblyError: If CRC32 check fails.
+        """
+        seq, total, crc, flags, data = parse_header(
+            raw_chunk
+        )
+
+        actual_crc = zlib.crc32(data) & 0xFFFFFFFF
+        if actual_crc != crc:
+            msg = (
+                f"CRC32 mismatch for chunk {seq}: "
+                f"expected {crc:#010x}, "
+                f"got {actual_crc:#010x}"
+            )
+            raise ReassemblyError(msg)
+
+        if self._total is None:
+            self._total = total
+        elif self._total != total:
+            msg = (
+                f"Total mismatch: expected "
+                f"{self._total}, got {total}"
+            )
+            raise ReassemblyError(msg)
+
+        if seq in self._chunks:
+            self._duplicates += 1
+            return seq
+
+        self._chunks[seq] = (flags, data)
+        return seq
+
+    def is_complete(self) -> bool:
+        """Check if all chunks have been received."""
+        if self._total is None:
+            return False
+        return len(self._chunks) == self._total
+
+    def try_reassemble(self) -> bytes:
+        """Attempt to reassemble the full payload.
+
+        Raises:
+            ReassemblyError: If chunks are missing,
+                flags inconsistent, or SHA-256 fails.
+        """
+        if not self.is_complete():
+            missing = self.missing_seqs
+            msg = (
+                f"Missing {len(missing)} chunks: "
+                f"{missing[:10]}"
+            )
+            raise ReassemblyError(msg)
+
+        ordered = sorted(self._chunks.items())
+
+        first_flags = ordered[0][1][0]
+        if not (first_flags & FLAG_FIRST):
+            msg = "First chunk missing FLAG_FIRST"
+            raise ReassemblyError(msg)
+
+        last_flags = ordered[-1][1][0]
+        if not (last_flags & FLAG_LAST):
+            msg = "Last chunk missing FLAG_LAST"
+            raise ReassemblyError(msg)
+
+        first_data = ordered[0][1][1]
+        if len(first_data) < 32:
+            msg = (
+                "First chunk too short to contain "
+                "SHA-256 hash"
+            )
+            raise ReassemblyError(msg)
+
+        expected_hash = first_data[:32]
+        payload_parts = [first_data[32:]]
+
+        for _seq, (_, data) in ordered[1:]:
+            payload_parts.append(data)
+
+        payload = b"".join(payload_parts)
+
+        actual_hash = hashlib.sha256(payload).digest()
+        if actual_hash != expected_hash:
+            msg = (
+                "SHA-256 verification failed: "
+                "payload corrupted"
+            )
+            raise ReassemblyError(msg)
+
+        return payload
+
+    def reset(self) -> None:
+        """Clear all received chunks."""
+        self._chunks.clear()
+        self._total = None
+        self._duplicates = 0
+\end{lstlisting}
+
+\newpage
+\section*{ПРИЛОЖЕНИЕ Г. Реализация стеганографических каналов}
+\addcontentsline{toc}{section}{ПРИЛОЖЕНИЕ Г. Реализация стеганографических каналов}
+
+\subsection*{Г.1 Базовый класс каналов (\texttt{channels/base.py})}
+
+\begin{lstlisting}[style=appendixcode]
+"""Abstract base class for steganographic channels.
+
+Every channel implementation must inherit from
+StegoChannel and implement all abstract methods.
+"""
+
+from abc import ABC, abstractmethod
+from scapy.packet import Packet
+
+
+class StegoChannel(ABC):
+    """Base class for all steganographic channels."""
+
+    @abstractmethod
+    def encode(
+        self, data: bytes, dest_ip: str, **kwargs,
+    ) -> list[Packet]:
+        """Encode data into a list of Scapy packets."""
+
+    @abstractmethod
+    def decode(
+        self, packets: list[Packet],
+    ) -> bytes:
+        """Decode hidden data from a list of packets."""
+
+    @property
+    @abstractmethod
+    def bits_per_packet(self) -> int:
+        """Number of data bits per single packet."""
+
+    @property
+    @abstractmethod
+    def protocol_filter(self) -> str:
+        """BPF filter string for the receiver sniffer.
+        May contain {ip} placeholder for source IP."""
+
+    @property
+    def name(self) -> str:
+        """Human-readable channel name."""
+        return self.__class__.__name__
+\end{lstlisting}
+
+\subsection*{Г.2 Канал ICMP Payload (\texttt{channels/icmp\_payload.py})}
+
+Канал использует поле данных ICMP Echo Request. Максимальная ёмкость ---
+1472~байт на пакет (MTU~1500 $-$ 20~IP $-$ 8~ICMP).
+
+\begin{lstlisting}[style=appendixcode]
+"""ICMP Echo payload steganographic channel.
+
+Hides data in the payload (data) field of ICMP Echo
+Request packets. Max payload: 1472 bytes
+(MTU 1500 - 20 IP header - 8 ICMP header).
+
+Reference: RFC 792.
+"""
+
+import struct
+from scapy.layers.inet import ICMP, IP
+from scapy.packet import Packet, Raw
+from netstego.channels.base import StegoChannel
+
+MAX_ICMP_PAYLOAD = 1472
+
+
+class IcmpPayloadChannel(StegoChannel):
+    """Steganographic channel using ICMP Echo payload.
+
+    Each packet carries up to 1472 bytes of hidden data.
+    A 2-byte length prefix is prepended so the decoder
+    knows how many bytes are valid in each packet.
+    """
+
+    @property
+    def bits_per_packet(self) -> int:
+        return MAX_ICMP_PAYLOAD * 8
+
+    @property
+    def protocol_filter(self) -> str:
+        return "icmp and src host {ip}"
+
+    def encode(
+        self, data: bytes, dest_ip: str, **kwargs,
+    ) -> list[Packet]:
+        """Encode data into ICMP Echo Request packets."""
+        max_data = MAX_ICMP_PAYLOAD - 2
+        packets: list[Packet] = []
+        offset = 0
+        seq = 0
+
+        while offset < len(data):
+            chunk = data[offset : offset + max_data]
+            payload = (
+                struct.pack(">H", len(chunk)) + chunk
+            )
+            pkt = (
+                IP(dst=dest_ip)
+                / ICMP(type=8, code=0, seq=seq)
+                / Raw(load=payload)
+            )
+            packets.append(pkt)
+            offset += max_data
+            seq += 1
+
+        return packets
+
+    def decode(
+        self, packets: list[Packet],
+    ) -> bytes:
+        """Decode hidden data from ICMP packets."""
+        sorted_pkts = sorted(
+            packets, key=lambda p: p[ICMP].seq
+        )
+        parts: list[bytes] = []
+
+        for pkt in sorted_pkts:
+            raw = bytes(pkt[Raw].load)
+            length = struct.unpack(">H", raw[:2])[0]
+            parts.append(raw[2 : 2 + length])
+
+        return b"".join(parts)
+\end{lstlisting}
+
+\newpage
+\subsection*{Г.3 Канал IP Identification (\texttt{channels/ip\_id.py})}
+
+Канал встраивает данные в 16-битное поле идентификации IPv4-заголовка.
+Ёмкость --- 2~байта на пакет.
+
+\begin{lstlisting}[style=appendixcode]
+"""IP Identification field steganographic channel.
+
+Hides data in the 16-bit IP ID field of IPv4 packets.
+Each packet carries 2 bytes (16 bits) of hidden data.
+
+Reference: RFC 791, Section 3.1.
+"""
+
+import struct
+from scapy.layers.inet import IP, ICMP
+from scapy.packet import Packet, Raw
+from netstego.channels.base import StegoChannel
+
+BITS_PER_PACKET = 16
+
+
+class IpIdChannel(StegoChannel):
+    """Steganographic channel using IPv4 ID field.
+
+    Each packet embeds 2 bytes of data in IP ID.
+    ICMP Echo Request is used as carrier protocol.
+    """
+
+    @property
+    def bits_per_packet(self) -> int:
+        return BITS_PER_PACKET
+
+    @property
+    def protocol_filter(self) -> str:
+        return "icmp and src host {ip}"
+
+    def encode(
+        self, data: bytes, dest_ip: str, **kwargs,
+    ) -> list[Packet]:
+        """Encode data into IP packets using ID field."""
+        packets: list[Packet] = []
+        offset = 0
+        seq = 0
+
+        while offset < len(data):
+            chunk = data[offset : offset + 2]
+            if len(chunk) == 1:
+                chunk = chunk + b"\x00"
+            ip_id = struct.unpack(">H", chunk)[0]
+            pkt = (
+                IP(dst=dest_ip, id=ip_id)
+                / ICMP(type=8, code=0, seq=seq)
+                / Raw(load=b"\x00" * 32)
+            )
+            packets.append(pkt)
+            offset += 2
+            seq += 1
+
+        # Termination packet with total data length
+        term_payload = struct.pack(">I", len(data))
+        pkt = (
+            IP(dst=dest_ip, id=0xFFFF)
+            / ICMP(type=8, code=0, seq=seq)
+            / Raw(load=term_payload)
+        )
+        packets.append(pkt)
+        return packets
+
+    def decode(
+        self, packets: list[Packet],
+    ) -> bytes:
+        """Decode hidden data from IP ID fields."""
+        icmp_pkts = [
+            p for p in packets if p.haslayer(ICMP)
+        ]
+        sorted_pkts = sorted(
+            icmp_pkts, key=lambda p: p[ICMP].seq
+        )
+
+        if not sorted_pkts:
+            return b""
+
+        term_pkt = sorted_pkts[-1]
+        term_raw = (
+            bytes(term_pkt[Raw].load)
+            if term_pkt.haslayer(Raw)
+            else b""
+        )
+        if (
+            len(term_raw) >= 4
+            and term_pkt[IP].id == 0xFFFF
+        ):
+            total_len = struct.unpack(
+                ">I", term_raw[:4]
+            )[0]
+            data_pkts = sorted_pkts[:-1]
+        else:
+            total_len = len(sorted_pkts) * 2
+            data_pkts = sorted_pkts
+
+        parts: list[bytes] = []
+        for pkt in data_pkts:
+            ip_id = pkt[IP].id
+            parts.append(struct.pack(">H", ip_id))
+
+        result = b"".join(parts)
+        return result[:total_len]
+\end{lstlisting}
+
+\newpage
+\subsection*{Г.4 Канал TCP ISN (\texttt{channels/tcp\_isn.py})}
+
+Канал встраивает данные в 32-битное поле начального порядкового номера
+TCP-сегмента (SYN-пакеты). Ёмкость --- 4~байта на пакет.
+
+\begin{lstlisting}[style=appendixcode]
+"""TCP Initial Sequence Number steganographic channel.
+
+Hides data in the 32-bit TCP Sequence Number field
+of SYN packets. Each SYN carries 4 bytes of data.
+
+Reference: RFC 793, Section 3.1.
+           RFC 6528 -- Sequence Number Attacks.
+"""
+
+import struct
+from scapy.layers.inet import IP, TCP
+from scapy.packet import Packet
+from netstego.channels.base import StegoChannel
+
+BITS_PER_PACKET = 32
+
+
+class TcpIsnChannel(StegoChannel):
+    """Steganographic channel using TCP ISN.
+
+    Each TCP SYN embeds 4 bytes of data in seq number.
+    Uses incrementing destination ports for ordering.
+    """
+
+    @property
+    def bits_per_packet(self) -> int:
+        return BITS_PER_PACKET
+
+    @property
+    def protocol_filter(self) -> str:
+        return (
+            "tcp[tcpflags] & tcp-syn != 0 "
+            "and src host {ip}"
+        )
+
+    def encode(
+        self, data: bytes, dest_ip: str, **kwargs,
+    ) -> list[Packet]:
+        """Encode data into TCP SYN packets."""
+        base_port = kwargs.get("base_port", 10000)
+        packets: list[Packet] = []
+        offset = 0
+        port_offset = 0
+
+        while offset < len(data):
+            chunk = data[offset : offset + 4]
+            padded = chunk.ljust(4, b"\x00")
+            isn = struct.unpack(">I", padded)[0]
+            dport = base_port + port_offset
+            pkt = IP(dst=dest_ip) / TCP(
+                sport=40000 + port_offset,
+                dport=dport,
+                seq=isn,
+                flags="S",
+            )
+            packets.append(pkt)
+            offset += 4
+            port_offset += 1
+
+        # Termination SYN with data length in seq
+        term_pkt = IP(dst=dest_ip) / TCP(
+            sport=65535,
+            dport=base_port + port_offset,
+            seq=len(data),
+            flags="S",
+        )
+        packets.append(term_pkt)
+        return packets
+
+    def decode(
+        self, packets: list[Packet],
+    ) -> bytes:
+        """Decode hidden data from TCP SYN ISNs."""
+        tcp_pkts = [
+            p for p in packets
+            if p.haslayer(TCP) and p[TCP].flags & 0x02
+        ]
+        sorted_pkts = sorted(
+            tcp_pkts, key=lambda p: p[TCP].dport
+        )
+
+        if not sorted_pkts:
+            return b""
+
+        term_pkt = sorted_pkts[-1]
+        if term_pkt[TCP].sport == 65535:
+            total_len = term_pkt[TCP].seq
+            data_pkts = sorted_pkts[:-1]
+        else:
+            total_len = len(sorted_pkts) * 4
+            data_pkts = sorted_pkts
+
+        parts: list[bytes] = []
+        for pkt in data_pkts:
+            isn = pkt[TCP].seq
+            parts.append(struct.pack(">I", isn))
+
+        result = b"".join(parts)
+        return result[:total_len]
+\end{lstlisting}
+
+\newpage
+\subsection*{Г.5 Канал DNS QNAME (\texttt{channels/dns\_query.py})}
+
+Канал кодирует данные в поддоменных метках DNS-запросов с использованием
+Base32. Ёмкость --- до 30~байт на пакет. Суффикс домена является
+конфигурируемым параметром.
+
+\begin{lstlisting}[style=appendixcode]
+"""DNS QNAME subdomain steganographic channel.
+
+Hides data in DNS query names using base32-encoded
+subdomains. Each DNS query carries up to ~30 raw
+bytes per packet.
+
+Reference: RFC 1035, Section 4.
+"""
+
+import base64
+import struct
+from scapy.layers.dns import DNS, DNSQR
+from scapy.layers.inet import IP, UDP
+from scapy.packet import Packet
+from netstego.channels.base import StegoChannel
+
+MAX_RAW_BYTES = 30
+DEFAULT_DOMAIN_SUFFIX = "cdn-cache.net"
+
+
+class DnsQueryChannel(StegoChannel):
+    """Steganographic channel using DNS QNAME.
+
+    Data is base32-encoded into subdomain labels.
+    The domain suffix is configurable to avoid
+    trivial signature detection.
+    """
+
+    def __init__(
+        self, domain_suffix: str | None = None,
+    ) -> None:
+        self._suffix = (
+            domain_suffix or DEFAULT_DOMAIN_SUFFIX
+        )
+
+    @property
+    def domain_suffix(self) -> str:
+        return self._suffix
+
+    @property
+    def bits_per_packet(self) -> int:
+        return MAX_RAW_BYTES * 8
+
+    @property
+    def protocol_filter(self) -> str:
+        return "udp port 53 and src host {ip}"
+
+    def encode(
+        self, data: bytes, dest_ip: str, **kwargs,
+    ) -> list[Packet]:
+        """Encode data into DNS query packets."""
+        packets: list[Packet] = []
+        offset = 0
+        tx_id = 0
+
+        while offset < len(data):
+            chunk = data[offset : offset + MAX_RAW_BYTES]
+            encoded = (
+                base64.b32encode(chunk)
+                .rstrip(b"=")
+                .decode("ascii")
+                .lower()
+            )
+            labels = []
+            for i in range(0, len(encoded), 63):
+                labels.append(encoded[i : i + 63])
+            qname = (
+                ".".join(labels)
+                + "." + self._suffix + "."
+            )
+
+            pkt = (
+                IP(dst=dest_ip)
+                / UDP(sport=30000 + tx_id, dport=53)
+                / DNS(
+                    id=tx_id,
+                    qd=DNSQR(qname=qname, qtype="A"),
+                )
+            )
+            packets.append(pkt)
+            offset += MAX_RAW_BYTES
+            tx_id += 1
+
+        # Termination query with data length
+        term_payload = struct.pack(">I", len(data))
+        term_encoded = (
+            base64.b32encode(term_payload)
+            .rstrip(b"=")
+            .decode("ascii")
+            .lower()
+        )
+        term_qname = (
+            f"{term_encoded}.term.{self._suffix}."
+        )
+        pkt = (
+            IP(dst=dest_ip)
+            / UDP(sport=30000 + tx_id, dport=53)
+            / DNS(
+                id=tx_id,
+                qd=DNSQR(qname=term_qname, qtype="A"),
+            )
+        )
+        packets.append(pkt)
+        return packets
+
+    def decode(
+        self, packets: list[Packet],
+    ) -> bytes:
+        """Decode hidden data from DNS query names."""
+        dns_pkts = [
+            p for p in packets
+            if p.haslayer(DNS) and p.haslayer(DNSQR)
+        ]
+        sorted_pkts = sorted(
+            dns_pkts, key=lambda p: p[DNS].id
+        )
+
+        if not sorted_pkts:
+            return b""
+
+        total_len = None
+        data_pkts = []
+
+        for pkt in sorted_pkts:
+            qname = pkt[DNSQR].qname
+            if isinstance(qname, bytes):
+                qname = qname.decode(
+                    "ascii", errors="ignore"
+                )
+            qname = qname.rstrip(".")
+
+            parts = qname.split(".")
+
+            if (
+                len(parts) >= 3
+                and parts[-2] == "term"
+            ):
+                encoded = parts[0].upper()
+                pad = (8 - len(encoded) % 8) % 8
+                encoded += "=" * pad
+                try:
+                    length_bytes = base64.b32decode(
+                        encoded
+                    )
+                    if len(length_bytes) >= 4:
+                        total_len = struct.unpack(
+                            ">I", length_bytes[:4]
+                        )[0]
+                except Exception:
+                    pass
+            else:
+                data_pkts.append(pkt)
+
+        parts_data: list[bytes] = []
+        for pkt in data_pkts:
+            qname = pkt[DNSQR].qname
+            if isinstance(qname, bytes):
+                qname = qname.decode(
+                    "ascii", errors="ignore"
+                )
+            qname = qname.rstrip(".")
+
+            labels = qname.split(".")
+            data_labels = labels[:-2]
+            encoded = "".join(data_labels).upper()
+            pad = (8 - len(encoded) % 8) % 8
+            encoded += "=" * pad
+            try:
+                decoded = base64.b32decode(encoded)
+                parts_data.append(decoded)
+            except Exception:
+                continue
+
+        result = b"".join(parts_data)
+        if total_len is not None:
+            result = result[:total_len]
+        return result
+\end{lstlisting}
+
+\newpage
+\subsection*{Г.6 Канал TCP Timestamp (\texttt{channels/tcp\_timestamp.py})}
+
+Канал встраивает данные в поле TSval опции TCP Timestamp.
+Ёмкость --- 4~байта (32~бита) на пакет.
+
+\begin{lstlisting}[style=appendixcode]
+"""TCP Timestamp steganographic channel.
+
+Hides data in the TCP Timestamp Value (TSval) option.
+Each packet carries 4 bytes (32 bits) of hidden data.
+
+Reference: RFC 7323, Section 3.
+"""
+
+import struct
+from scapy.layers.inet import IP, TCP
+from scapy.packet import Packet
+from netstego.channels.base import StegoChannel
+
+BITS_PER_PACKET = 32
+
+
+class TcpTimestampChannel(StegoChannel):
+    """Steganographic channel using TCP TSval.
+
+    Each packet embeds 4 bytes of data in the TCP
+    Timestamp Value option. Uses ACK packets with
+    incrementing sequence numbers for ordering.
+    """
+
+    @property
+    def bits_per_packet(self) -> int:
+        return BITS_PER_PACKET
+
+    @property
+    def protocol_filter(self) -> str:
+        return "tcp and src host {ip}"
+
+    def encode(
+        self, data: bytes, dest_ip: str, **kwargs,
+    ) -> list[Packet]:
+        """Encode data into TCP packets using TSval."""
+        base_port = kwargs.get("base_port", 20000)
+        packets: list[Packet] = []
+        offset = 0
+        seq_num = 0
+
+        while offset < len(data):
+            chunk = data[offset : offset + 4]
+            padded = chunk.ljust(4, b"\x00")
+            tsval = struct.unpack(">I", padded)[0]
+            ts_option = ("Timestamp", (tsval, 0))
+            pkt = IP(dst=dest_ip) / TCP(
+                sport=50000 + seq_num,
+                dport=base_port,
+                seq=seq_num,
+                flags="A",
+                options=[ts_option],
+            )
+            packets.append(pkt)
+            offset += 4
+            seq_num += 1
+
+        # Termination: TSecr=1 marks termination
+        ts_option = ("Timestamp", (len(data), 1))
+        term_pkt = IP(dst=dest_ip) / TCP(
+            sport=50000 + seq_num,
+            dport=base_port,
+            seq=seq_num,
+            flags="A",
+            options=[ts_option],
+        )
+        packets.append(term_pkt)
+        return packets
+
+    def decode(
+        self, packets: list[Packet],
+    ) -> bytes:
+        """Decode hidden data from TCP Timestamp."""
+        tcp_pkts = [
+            p for p in packets if p.haslayer(TCP)
+        ]
+        sorted_pkts = sorted(
+            tcp_pkts, key=lambda p: p[TCP].seq
+        )
+
+        if not sorted_pkts:
+            return b""
+
+        total_len = None
+        data_pkts = []
+
+        for pkt in sorted_pkts:
+            options = pkt[TCP].options
+            tsval, tsecr = None, None
+            for opt_name, opt_val in options:
+                if opt_name == "Timestamp":
+                    tsval, tsecr = opt_val
+                    break
+
+            if tsval is None:
+                continue
+
+            if tsecr == 1:
+                total_len = tsval
+            else:
+                data_pkts.append((tsval,))
+
+        parts: list[bytes] = []
+        for (tsval,) in data_pkts:
+            parts.append(struct.pack(">I", tsval))
+
+        result = b"".join(parts)
+        if total_len is not None:
+            result = result[:total_len]
+        return result
+\end{lstlisting}
+
+\newpage
+\section*{ПРИЛОЖЕНИЕ Д. Сетевой конвейер отправки и приёма данных}
+\addcontentsline{toc}{section}{ПРИЛОЖЕНИЕ Д. Сетевой конвейер отправки и приёма данных}
+
+\subsection*{Д.1 Модуль отправки (\texttt{network/sender.py})}
+
+Модуль реализует полный конвейер отправки: чтение файла, шифрование
+AES-256-GCM, фрагментацию с NST-заголовками, кодирование через
+выбранный стеганографический канал, отправку с управлением
+скоростью и джиттером, сбор статистики и сохранение в PCAP.
+
+\begin{lstlisting}[style=appendixcode]
+"""Sender module: encrypts, fragments, encodes,
+and transmits steganographic packets.
+
+Handles the full pipeline:
+    1. Read file -> encrypt with AES-256-GCM
+    2. Fragment ciphertext into chunks with headers
+    3. Frame chunks with length prefixes and encode
+       via StegoChannel
+    4. Send packets with configurable rate and jitter
+    5. Optionally save sent packets to PCAP
+"""
+
+import platform
+import random
+import struct
+import sys
+import time
+from pathlib import Path
+
+from rich.console import Console
+from rich.progress import Progress
+from scapy.sendrecv import send as scapy_send
+from scapy.utils import wrpcap
+
+from netstego.channels.base import StegoChannel
+from netstego.config import TimingConfig
+from netstego.core.crypto import encrypt, load_key
+from netstego.core.fragmentation import fragment
+from netstego.stats.collector import StatsCollector
+
+console = Console()
+
+
+def check_privileges() -> None:
+    """Verify raw socket privileges.
+
+    On Linux/macOS checks for root or CAP_NET_RAW.
+    On Windows requires Administrator.
+    """
+    if platform.system() == "Windows":
+        import ctypes
+        if not ctypes.windll.shell32.IsUserAnAdmin():
+            console.print(
+                "[red]Error:[/red] "
+                "Administrator privileges required."
+            )
+            sys.exit(1)
+    else:
+        import os
+        if os.geteuid() != 0:
+            try:
+                import socket
+                s = socket.socket(
+                    socket.AF_PACKET,
+                    socket.SOCK_RAW,
+                )
+                s.close()
+            except (PermissionError, OSError):
+                console.print(
+                    "[red]Error:[/red] "
+                    "Root or CAP_NET_RAW required."
+                )
+                sys.exit(1)
+
+
+def get_channel(
+    channel_name: str, **kwargs,
+) -> StegoChannel:
+    """Instantiate a StegoChannel by config name.
+
+    Args:
+        channel_name: One of 'icmp', 'ip-id',
+            'tcp-isn', 'dns', 'tcp-ts'.
+        **kwargs: Channel-specific options.
+
+    Raises:
+        ValueError: If channel name is unknown.
+    """
+    if channel_name == "icmp":
+        from netstego.channels.icmp_payload import (
+            IcmpPayloadChannel,
+        )
+        return IcmpPayloadChannel()
+    if channel_name == "ip-id":
+        from netstego.channels.ip_id import (
+            IpIdChannel,
+        )
+        return IpIdChannel()
+    if channel_name == "tcp-isn":
+        from netstego.channels.tcp_isn import (
+            TcpIsnChannel,
+        )
+        return TcpIsnChannel()
+    if channel_name == "dns":
+        from netstego.channels.dns_query import (
+            DnsQueryChannel,
+        )
+        return DnsQueryChannel(
+            domain_suffix=kwargs.get("domain_suffix")
+        )
+    if channel_name == "tcp-ts":
+        from netstego.channels.tcp_timestamp import (
+            TcpTimestampChannel,
+        )
+        return TcpTimestampChannel()
+
+    msg = f"Unknown channel: {channel_name!r}"
+    raise ValueError(msg)
+
+
+def frame_chunks(chunks: list[bytes]) -> bytes:
+    """Frame chunks with 4-byte length prefixes.
+
+    Format: [len1(4)][chunk1][len2(4)][chunk2]...
+    """
+    parts = []
+    for chunk in chunks:
+        parts.append(struct.pack(">I", len(chunk)))
+        parts.append(chunk)
+    return b"".join(parts)
+
+
+def send_data(
+    data: bytes,
+    dest_ip: str,
+    key_path: Path,
+    channel_name: str,
+    timing: TimingConfig | None = None,
+    redundancy: int = 1,
+    pcap_out: Path | None = None,
+    db_path: str | None = None,
+) -> int:
+    """Encrypt, fragment, and send data through
+    a steganographic channel.
+
+    Args:
+        data: Raw plaintext bytes to send.
+        dest_ip: Destination IP address.
+        key_path: Path to the AES-256 key file.
+        channel_name: Steganographic channel name.
+        timing: Timing config (rate, jitter).
+        redundancy: Chunk duplication factor.
+        pcap_out: Path to save packets as PCAP.
+        db_path: Path to stats database.
+
+    Returns:
+        Total number of packets sent.
+    """
+    check_privileges()
+
+    if timing is None:
+        timing = TimingConfig()
+
+    key = load_key(key_path)
+    console.print(
+        f"[dim]Key loaded from {key_path}[/dim]"
+    )
+    console.print(
+        f"[dim]Data size: {len(data)} bytes[/dim]"
+    )
+
+    ciphertext = encrypt(data, key)
+    console.print(
+        f"[dim]Ciphertext size: "
+        f"{len(ciphertext)} bytes[/dim]"
+    )
+
+    channel = get_channel(channel_name)
+
+    bytes_per_packet = channel.bits_per_packet // 8
+    overhead = 17 + 4
+    if bytes_per_packet > overhead + 33:
+        chunk_data_size = bytes_per_packet - overhead
+    else:
+        chunk_data_size = 128
+
+    chunks = fragment(ciphertext, chunk_data_size)
+    console.print(
+        f"[dim]Fragmented into {len(chunks)} chunks "
+        f"({chunk_data_size} data bytes/chunk)[/dim]"
+    )
+
+    if redundancy > 1:
+        redundant_chunks = []
+        for chunk in chunks:
+            for _ in range(redundancy):
+                redundant_chunks.append(chunk)
+        random.shuffle(redundant_chunks)
+        console.print(
+            f"[dim]Redundancy x{redundancy}: "
+            f"{len(redundant_chunks)} chunks "
+            f"({len(chunks)} unique)[/dim]"
+        )
+        chunks = redundant_chunks
+
+    framed = frame_chunks(chunks)
+    all_packets = channel.encode(framed, dest_ip)
+
+    total_packets = len(all_packets)
+    console.print(
+        f"[bold green]Sending {total_packets} "
+        f"packets[/bold green] via "
+        f"[cyan]{channel.name}[/cyan] to "
+        f"[cyan]{dest_ip}[/cyan]"
+    )
+
+    collector = StatsCollector(db_path=db_path)
+    session_id = collector.start_session(
+        direction="send",
+        channel=channel_name,
+        dest_ip=dest_ip,
+        file_size=len(data),
+        total_packets=total_packets,
+        total_chunks=len(chunks),
+    )
+
+    base_delay = (
+        1.0 / timing.rate_pps
+        if timing.rate_pps > 0
+        else 0.0
+    )
+
+    try:
+        with Progress(console=console) as progress:
+            task = progress.add_task(
+                "[green]Transmitting...",
+                total=total_packets,
+            )
+            for idx, pkt in enumerate(all_packets):
+                scapy_send(pkt, verbose=False)
+                collector.log_packet(
+                    session_id, seq=idx,
+                    field_name=channel.name,
+                    size=len(pkt),
+                )
+                progress.advance(task)
+
+                if base_delay > 0:
+                    jitter = random.uniform(
+                        -timing.jitter_factor
+                        * base_delay,
+                        timing.jitter_factor
+                        * base_delay,
+                    )
+                    delay = max(
+                        0.0, base_delay + jitter
+                    )
+                    time.sleep(delay)
+
+        collector.finish_session(
+            session_id, status="completed",
+            total_packets=total_packets,
+        )
+    except Exception:
+        collector.finish_session(
+            session_id, status="failed",
+            total_packets=total_packets,
+        )
+        raise
+
+    if pcap_out is not None:
+        wrpcap(str(pcap_out), all_packets)
+        console.print(
+            f"[dim]Packets saved to {pcap_out}[/dim]"
+        )
+
+    console.print(
+        f"[bold green]Done![/bold green] Sent "
+        f"{total_packets} packets "
+        f"({len(ciphertext)} bytes encrypted). "
+        f"Session: {session_id}"
+    )
+    return total_packets
+
+
+def send_file(
+    file_path: Path,
+    dest_ip: str,
+    key_path: Path,
+    channel_name: str,
+    timing: TimingConfig | None = None,
+    redundancy: int = 1,
+    pcap_out: Path | None = None,
+    db_path: str | None = None,
+) -> int:
+    """Read a file and send via send_data."""
+    plaintext = file_path.read_bytes()
+    return send_data(
+        data=plaintext,
+        dest_ip=dest_ip,
+        key_path=key_path,
+        channel_name=channel_name,
+        timing=timing,
+        redundancy=redundancy,
+        pcap_out=pcap_out,
+        db_path=db_path,
+    )
+\end{lstlisting}
+
+\newpage
+\subsection*{Д.2 Модуль приёма (\texttt{network/receiver.py})}
+
+Модуль реализует полный конвейер приёма: перехват пакетов (BPF-фильтр
+или чтение из PCAP), декодирование через стеганографический канал,
+извлечение и реассемблирование чанков, расшифрование AES-256-GCM
+и запись результата в файл.
+
+\begin{lstlisting}[style=appendixcode]
+"""Receiver module: sniffs packets, decodes,
+reassembles, and decrypts.
+
+Handles the full receive pipeline:
+    1. Sniff packets via AsyncSniffer with BPF filter
+       (or read from PCAP)
+    2. Decode packets via the chosen StegoChannel
+    3. Unframe length-prefixed chunks
+    4. Reassemble chunks with out-of-order support
+    5. Decrypt with AES-256-GCM and write output file
+"""
+
+import struct
+import time as _time
+from pathlib import Path
+
+from rich.console import Console
+from scapy.sendrecv import AsyncSniffer
+from scapy.utils import rdpcap, wrpcap
+
+from netstego.core.crypto import decrypt, load_key
+from netstego.core.reassembly import Reassembler
+from netstego.network.sender import (
+    check_privileges, get_channel,
+)
+from netstego.stats.collector import StatsCollector
+
+console = Console()
+
+
+def unframe_chunks(data: bytes) -> list[bytes]:
+    """Extract length-prefixed chunks from a framed
+    byte stream.
+
+    Format: [len1(4)][chunk1][len2(4)][chunk2]...
+    """
+    chunks = []
+    offset = 0
+    while offset + 4 <= len(data):
+        length = struct.unpack(
+            ">I", data[offset : offset + 4]
+        )[0]
+        offset += 4
+        if offset + length > len(data):
+            break
+        chunks.append(data[offset : offset + length])
+        offset += length
+    return chunks
+
+
+def receive_file(
+    sender_ip: str,
+    key_path: Path,
+    output_path: Path,
+    channel_name: str,
+    timeout: int = 60,
+    pcap_out: Path | None = None,
+    pcap_in: Path | None = None,
+    iface: str | None = None,
+    db_path: str | None = None,
+) -> bool:
+    """Receive and reconstruct a file from a
+    steganographic channel.
+
+    Args:
+        sender_ip: IP address of the sender.
+        key_path: Path to the AES-256 key file.
+        output_path: Path to write decrypted output.
+        channel_name: Steganographic channel name.
+        timeout: Sniffing timeout in seconds.
+        pcap_out: Path to save captured packets.
+        pcap_in: PCAP file to read instead of sniffing.
+        iface: Network interface name for sniffing.
+        db_path: Path to stats database.
+
+    Returns:
+        True if file was successfully received.
+    """
+    if pcap_in is None:
+        check_privileges()
+
+    key = load_key(key_path)
+    console.print(
+        f"[dim]Key loaded from {key_path}[/dim]"
+    )
+
+    channel = get_channel(channel_name)
+
+    collector = StatsCollector(db_path=db_path)
+    session_id = collector.start_session(
+        direction="receive",
+        channel=channel_name,
+        bind_ip=sender_ip,
+    )
+
+    if pcap_in is not None:
+        console.print(
+            f"[bold blue]Reading from PCAP:[/bold blue]"
+            f" {pcap_in}"
+        )
+        all_packets = list(rdpcap(str(pcap_in)))
+    else:
+        bpf_filter = channel.protocol_filter.format(
+            ip=sender_ip
+        )
+        console.print(
+            f"[bold blue]Listening[/bold blue] for "
+            f"packets from [cyan]{sender_ip}[/cyan] "
+            f"via [cyan]{channel.name}[/cyan] "
+            f"(timeout={timeout}s)"
+        )
+        console.print(
+            f"[dim]BPF filter: {bpf_filter}[/dim]"
+        )
+        if iface:
+            console.print(
+                f"[dim]Interface: {iface}[/dim]"
+            )
+
+        sniffer_kwargs = {
+            "filter": bpf_filter, "store": True,
+        }
+        if iface:
+            sniffer_kwargs["iface"] = iface
+
+        sniffer = AsyncSniffer(**sniffer_kwargs)
+        sniffer.start()
+
+        try:
+            _time.sleep(timeout)
+        except KeyboardInterrupt:
+            console.print(
+                "\n[yellow]Interrupted[/yellow]"
+            )
+        finally:
+            sniffer.stop()
+
+        all_packets = (
+            list(sniffer.results)
+            if sniffer.results
+            else []
+        )
+
+    console.print(
+        f"[dim]Captured {len(all_packets)} "
+        f"packets[/dim]"
+    )
+
+    for idx, pkt in enumerate(all_packets):
+        collector.log_packet(
+            session_id, seq=idx,
+            field_name=channel.name,
+            size=len(pkt),
+        )
+
+    if not all_packets:
+        console.print(
+            "[red]Error:[/red] No packets received."
+        )
+        collector.finish_session(
+            session_id, status="failed"
+        )
+        return False
+
+    if pcap_out is not None:
+        wrpcap(str(pcap_out), all_packets)
+        console.print(
+            f"[dim]Packets saved to {pcap_out}[/dim]"
+        )
+
+    try:
+        raw_data = channel.decode(all_packets)
+    except Exception as e:
+        console.print(
+            f"[red]Error decoding:[/red] {e}"
+        )
+        collector.finish_session(
+            session_id, status="failed",
+            total_packets=len(all_packets),
+        )
+        return False
+
+    console.print(
+        f"[dim]Decoded {len(raw_data)} bytes[/dim]"
+    )
+
+    chunks = unframe_chunks(raw_data)
+    console.print(
+        f"[dim]Extracted {len(chunks)} chunks[/dim]"
+    )
+
+    if not chunks:
+        console.print(
+            "[red]Error:[/red] No valid chunks found."
+        )
+        collector.finish_session(
+            session_id, status="failed",
+            total_packets=len(all_packets),
+        )
+        return False
+
+    reassembler = Reassembler()
+    for chunk in chunks:
+        try:
+            reassembler.add_chunk(chunk)
+        except Exception as e:
+            console.print(
+                f"[yellow]Warning:[/yellow] "
+                f"Skipping bad chunk: {e}"
+            )
+
+    if reassembler.duplicates_received > 0:
+        console.print(
+            f"[dim]Deduplicated "
+            f"{reassembler.duplicates_received} "
+            f"redundant chunks[/dim]"
+        )
+
+    if not reassembler.is_complete():
+        missing = reassembler.missing_seqs
+        total = reassembler.total_expected or 0
+        received = reassembler.received_count
+        loss_pct = (
+            (len(missing) / total * 100)
+            if total > 0
+            else 0
+        )
+        console.print(
+            f"[red]Error:[/red] Reassembly incomplete."
+            f" Received {received}/{total} chunks "
+            f"({loss_pct:.1f}% loss). "
+            f"Missing: {missing[:10]}"
+        )
+        collector.finish_session(
+            session_id, status="failed",
+            total_packets=len(all_packets),
+        )
+        return False
+
+    try:
+        ciphertext = reassembler.try_reassemble()
+    except Exception as e:
+        console.print(
+            f"[red]Error during reassembly:[/red] {e}"
+        )
+        collector.finish_session(
+            session_id, status="failed",
+            total_packets=len(all_packets),
+        )
+        return False
+
+    console.print(
+        f"[dim]Reassembled {len(ciphertext)} bytes "
+        f"of ciphertext[/dim]"
+    )
+
+    try:
+        plaintext = decrypt(ciphertext, key)
+    except Exception as e:
+        console.print(
+            f"[red]Error during decryption:[/red] {e}"
+        )
+        collector.finish_session(
+            session_id, status="failed",
+            total_packets=len(all_packets),
+        )
+        return False
+
+    output_path.parent.mkdir(
+        parents=True, exist_ok=True
+    )
+    output_path.write_bytes(plaintext)
+
+    collector.finish_session(
+        session_id, status="completed",
+        total_packets=len(all_packets),
+    )
+    console.print(
+        f"[bold green]Done![/bold green] Received "
+        f"{len(plaintext)} bytes -> {output_path} "
+        f"(session: {session_id})"
+    )
+    return True
+\end{lstlisting}

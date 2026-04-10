@@ -17,24 +17,53 @@ def cli() -> None:
 
 
 @cli.command()
-@click.option("--file", "file_path", required=True, type=click.Path(exists=True), help="File to send.")
+@click.option("--file", "file_path", default=None, type=click.Path(exists=True), help="File to send.")
+@click.option("--text", "text_input", default=None, help="Text string to send (alternative to --file).")
 @click.option("--channel", required=True, type=click.Choice(["ip-id", "tcp-isn", "icmp", "dns", "tcp-ts"]))
 @click.option("--dest", required=True, help="Destination IP address.")
 @click.option("--key-file", required=True, type=click.Path(exists=True), help="Encryption key file.")
 @click.option("--rate", default=10, type=int, help="Packets per second.")
+@click.option("--redundancy", default=1, type=int, help="Send each chunk N times for loss tolerance.")
 @click.option("--pcap-out", default=None, type=click.Path(), help="Save sent packets to PCAP.")
-def send(file_path: str, channel: str, dest: str, key_file: str, rate: int, pcap_out: str | None) -> None:
-    """Send a file through a steganographic channel."""
-    from netstego.network.sender import send_file
+@click.option("--dry-run", is_flag=True, help="Build packets and save PCAP without sending over network.")
+def send(
+    file_path: str | None,
+    text_input: str | None,
+    channel: str,
+    dest: str,
+    key_file: str,
+    rate: int,
+    redundancy: int,
+    pcap_out: str | None,
+    dry_run: bool,
+) -> None:
+    """Send a file or text through a steganographic channel."""
+    from netstego.network.sender import send_data
+
+    if file_path is None and text_input is None:
+        raise click.UsageError("Either --file or --text must be provided.")
+    if file_path is not None and text_input is not None:
+        raise click.UsageError("Use either --file or --text, not both.")
+    if dry_run and pcap_out is None:
+        raise click.UsageError("--dry-run requires --pcap-out to save packets.")
+
+    if text_input is not None:
+        data = text_input.encode("utf-8")
+        console.print(f"[dim]Text input: {len(data)} bytes[/dim]")
+    else:
+        data = Path(file_path).read_bytes()
+        console.print(f"[dim]File: {file_path} ({len(data)} bytes)[/dim]")
 
     timing = TimingConfig(rate_pps=rate)
-    send_file(
-        file_path=Path(file_path),
+    send_data(
+        data=data,
         dest_ip=dest,
         key_path=Path(key_file),
         channel_name=channel,
         timing=timing,
+        redundancy=redundancy,
         pcap_out=Path(pcap_out) if pcap_out else None,
+        dry_run=dry_run,
     )
 
 
@@ -167,3 +196,68 @@ def keygen(output: str) -> None:
 
     key = generate_key(Path(output))
     console.print(f"[bold green]Key generated:[/bold green] {output} ({len(key)} bytes)")
+
+
+@cli.command()
+@click.option("--output-dir", default="results", type=click.Path(), help="Output directory for reports and charts.")
+@click.option("--skip-monitoring", is_flag=True, help="Skip detection monitoring (faster).")
+@click.option("--repeat", default=3, type=int, help="Benchmark repeat count for averaging.")
+@click.option("--payload-sizes", default="64,256,1024,4096,16384", help="Comma-separated payload sizes.")
+def report(output_dir: str, skip_monitoring: bool, repeat: int, payload_sizes: str) -> None:
+    """Run full benchmarks, generate charts and reports."""
+    import json
+
+    from rich.table import Table
+
+    from netstego.benchmarks import run_all_benchmarks, run_all_monitoring
+    from netstego.stats.charts import generate_all_charts
+
+    out = Path(output_dir)
+    data_dir = out / "data"
+    charts_dir = out / "charts"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    sizes = [int(s.strip()) for s in payload_sizes.split(",")]
+
+    console.print("[bold cyan]Running pipeline benchmarks...[/bold cyan]")
+    bench_results = run_all_benchmarks(payload_sizes=sizes, repeat=repeat)
+
+    bench_path = data_dir / "benchmark_results.json"
+    bench_path.write_text(json.dumps(bench_results, indent=2))
+    console.print(f"[dim]Benchmark data saved to {bench_path}[/dim]")
+
+    # Print summary table
+    pipeline = bench_results["pipeline_benchmarks"]
+    table = Table(title="Pipeline Benchmark Summary (1024 B payload)")
+    table.add_column("Channel")
+    table.add_column("Packets", justify="right")
+    table.add_column("Total ms", justify="right")
+    table.add_column("Throughput", justify="right")
+
+    for r in pipeline:
+        if r["payload_bytes"] == 1024:
+            if r["throughput_Bps"] >= 1_000_000:
+                tp = f"{r['throughput_Bps'] / 1_000_000:.1f} MB/s"
+            elif r["throughput_Bps"] >= 1000:
+                tp = f"{r['throughput_Bps'] / 1000:.1f} KB/s"
+            else:
+                tp = f"{r['throughput_Bps']:.0f} B/s"
+            table.add_row(r["channel"], str(r["num_packets"]), f"{r['total_ms']:.2f}", tp)
+    console.print(table)
+
+    # Run monitoring (optional)
+    mon_results = None
+    if not skip_monitoring:
+        console.print("\n[bold cyan]Running detection monitoring...[/bold cyan]")
+        mon_results = run_all_monitoring()
+        mon_path = data_dir / "monitoring_results.json"
+        mon_path.write_text(json.dumps(mon_results, indent=2, ensure_ascii=False))
+        console.print(f"[dim]Monitoring data saved to {mon_path}[/dim]")
+
+    # Generate charts
+    console.print("\n[bold cyan]Generating charts...[/bold cyan]")
+    saved_charts = generate_all_charts(bench_results, mon_results, charts_dir)
+
+    console.print(f"\n[bold green]Done![/bold green] Generated {len(saved_charts)} charts:")
+    for path in saved_charts:
+        console.print(f"  {path}")

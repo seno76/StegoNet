@@ -24,11 +24,17 @@ class Reassembler:
     def __init__(self) -> None:
         self._chunks: dict[int, tuple[int, bytes]] = {}  # seq -> (flags, data)
         self._total: int | None = None
+        self._duplicates: int = 0
 
     @property
     def received_count(self) -> int:
         """Number of unique chunks received so far."""
         return len(self._chunks)
+
+    @property
+    def duplicates_received(self) -> int:
+        """Number of duplicate chunks discarded."""
+        return self._duplicates
 
     @property
     def total_expected(self) -> int | None:
@@ -69,6 +75,10 @@ class Reassembler:
         elif self._total != total:
             msg = f"Total mismatch: expected {self._total}, got {total}"
             raise ReassemblyError(msg)
+
+        if seq in self._chunks:
+            self._duplicates += 1
+            return seq
 
         self._chunks[seq] = (flags, data)
         return seq
@@ -135,3 +145,4 @@ class Reassembler:
         """Clear all received chunks."""
         self._chunks.clear()
         self._total = None
+        self._duplicates = 0

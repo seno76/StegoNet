@@ -87,20 +87,20 @@ class TestMLDetector:
         values = list(range(20))
         timestamps = [i * 0.1 for i in range(20)]
         features = extract_features(values, timestamps)
-        assert features.shape == (20, 7)
+        assert features.shape == (20, 9)
 
     def test_extract_features_empty(self) -> None:
         features = extract_features([], [])
-        assert features.shape == (0, 7)
+        assert features.shape == (0, 9)
 
     def test_isolation_forest_normal(self) -> None:
         rng = np.random.default_rng(42)
-        features = rng.normal(size=(100, 7))
+        features = rng.normal(size=(100, 9))
         result = detect_isolation_forest(features, contamination=0.05)
         assert result.anomaly_ratio < 0.2
 
     def test_isolation_forest_insufficient(self) -> None:
-        features = np.array([[1, 2, 3, 4, 5, 6, 7]])
+        features = np.array([[1, 2, 3, 4, 5, 6, 7, 8, 9]])
         result = detect_isolation_forest(features, contamination=0.05)
         assert not result.is_anomaly
         assert "Insufficient" in result.details

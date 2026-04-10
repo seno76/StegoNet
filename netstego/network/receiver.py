@@ -19,6 +19,7 @@ from scapy.utils import rdpcap, wrpcap
 from netstego.core.crypto import decrypt, load_key
 from netstego.core.reassembly import Reassembler
 from netstego.network.sender import check_privileges, get_channel
+from netstego.stats.collector import StatsCollector
 
 console = Console()
 
@@ -55,6 +56,7 @@ def receive_file(
     pcap_out: Path | None = None,
     pcap_in: Path | None = None,
     iface: str | None = None,
+    db_path: str | None = None,
 ) -> bool:
     """Receive and reconstruct a file from a steganographic channel.
 
@@ -67,6 +69,7 @@ def receive_file(
         pcap_out: Optional path to save captured packets as PCAP.
         pcap_in: Optional PCAP file to read instead of sniffing.
         iface: Optional network interface name for sniffing.
+        db_path: Optional path to stats database.
 
     Returns:
         True if file was successfully received and written.
@@ -112,8 +115,20 @@ def receive_file(
 
     console.print(f"[dim]Captured {len(all_packets)} packets[/dim]")
 
+    # Start stats session
+    collector = StatsCollector(db_path=db_path)
+    session_id = collector.start_session(
+        direction="receive",
+        channel=channel_name,
+        dest_ip=sender_ip,
+        file_size=0,
+        total_packets=len(all_packets),
+        total_chunks=0,
+    )
+
     if not all_packets:
         console.print("[red]Error:[/red] No packets received.")
+        collector.finish_session(session_id, status="failed", total_packets=0)
         return False
 
     # Save captured packets if requested
@@ -126,9 +141,14 @@ def receive_file(
         raw_data = channel.decode(all_packets)
     except Exception as e:
         console.print(f"[red]Error decoding packets:[/red] {e}")
+        collector.finish_session(session_id, status="failed", total_packets=len(all_packets))
         return False
 
     console.print(f"[dim]Decoded {len(raw_data)} bytes from packets[/dim]")
+
+    # Log packets
+    for idx, pkt in enumerate(all_packets):
+        collector.log_packet(session_id, seq=idx, field_name=channel.name, size=len(pkt))
 
     # Unframe and reassemble chunks
     chunks = unframe_chunks(raw_data)
@@ -136,6 +156,7 @@ def receive_file(
 
     if not chunks:
         console.print("[red]Error:[/red] No valid chunks found in decoded data.")
+        collector.finish_session(session_id, status="failed", total_packets=len(all_packets))
         return False
 
     reassembler = Reassembler()
@@ -151,12 +172,14 @@ def receive_file(
             f"[red]Error:[/red] Reassembly incomplete. "
             f"Missing {len(missing)} chunks: {missing[:10]}"
         )
+        collector.finish_session(session_id, status="failed", total_packets=len(all_packets))
         return False
 
     try:
         ciphertext = reassembler.try_reassemble()
     except Exception as e:
         console.print(f"[red]Error during reassembly:[/red] {e}")
+        collector.finish_session(session_id, status="failed", total_packets=len(all_packets))
         return False
 
     console.print(f"[dim]Reassembled {len(ciphertext)} bytes of ciphertext[/dim]")
@@ -166,13 +189,17 @@ def receive_file(
         plaintext = decrypt(ciphertext, key)
     except Exception as e:
         console.print(f"[red]Error during decryption:[/red] {e}")
+        collector.finish_session(session_id, status="failed", total_packets=len(all_packets))
         return False
 
     # Write output file
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(plaintext)
+
+    collector.finish_session(session_id, status="completed", total_packets=len(all_packets))
+
     console.print(
         f"[bold green]Done![/bold green] Received {len(plaintext)} bytes "
-        f"-> {output_path}"
+        f"-> {output_path} (session: {session_id})"
     )
     return True

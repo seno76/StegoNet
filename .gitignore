@@ -1,18 +1,58 @@
-.venv/
-venv/
+# Python
 __pycache__/
 *.pyc
 *.pyo
-*.pem
-*.bin
-*.pcap
-!tests/pcap_samples/*.pcap
-*.db
-.env
 *.egg-info/
 dist/
 build/
+.venv/
+venv/
+
+# Testing
 .pytest_cache/
 htmlcov/
 .coverage
-agents/
+
+# Keys and secrets
+*.key
+*.pem
+*.bin
+.env
+
+# PCAP files (except test samples)
+*.pcap
+!tests/pcap_samples/*.pcap
+
+# Database
+*.db
+
+# Benchmark/monitoring output
+*_results.json
+*_key.tmp
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
+*.rar
+*.zip
+
+# LaTeX build artifacts
+diploma/*.aux
+diploma/*.log
+diploma/*.out
+diploma/*.toc
+diploma/*.synctex.gz
+
+# Claude Code
+.claude/
+
+# Misc
+texput.log

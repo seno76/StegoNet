@@ -23,10 +23,22 @@ class MLResult:
     details: str = ""
 
 
+def _payload_entropy(data: bytes) -> float:
+    """Compute Shannon entropy of payload bytes (bits per byte)."""
+    if not data:
+        return 0.0
+    counts = np.zeros(256)
+    for b in data:
+        counts[b] += 1
+    probs = counts[counts > 0] / len(data)
+    return float(-np.sum(probs * np.log2(probs)))
+
+
 def extract_features(
     field_values: list[int],
     timestamps: list[float],
     packet_sizes: list[int] | None = None,
+    payloads: list[bytes] | None = None,
 ) -> np.ndarray:
     """Extract feature vectors from packet data.
 
@@ -38,22 +50,26 @@ def extract_features(
         - Rolling mean of field values
         - Rolling std of field values
         - Rolling mean of IPD
+        - Payload entropy (bits/byte)
+        - Payload length
 
     Args:
         field_values: List of field values (e.g., IP IDs).
         timestamps: List of packet timestamps.
         packet_sizes: Optional list of packet sizes.
+        payloads: Optional list of raw payload bytes.
 
     Returns:
         2D numpy array of shape (n_samples, n_features).
     """
     n = len(field_values)
     if n < 2:
-        return np.empty((0, 7))
+        return np.empty((0, 9))
 
     values = np.array(field_values, dtype=float)
     times = np.array(timestamps, dtype=float)
     sizes = np.array(packet_sizes, dtype=float) if packet_sizes else np.zeros(n)
+    pays = payloads if payloads else [b""] * n
 
     # Compute deltas
     value_deltas = np.diff(values, prepend=values[0])
@@ -74,6 +90,8 @@ def extract_features(
             float(np.mean(win_vals)),
             float(np.std(win_vals)),
             float(np.mean(win_ipd)),
+            _payload_entropy(pays[i]),
+            float(len(pays[i])),
         ])
 
     return np.array(features)
@@ -153,3 +171,50 @@ def train_classifier(
     )
     clf.fit(scaled, labels)
     return clf
+
+
+@dataclass
+class RFResult:
+    """Result of RandomForest classification."""
+
+    accuracy: float
+    predictions: list[int]
+    feature_importances: list[float]
+
+
+def detect_random_forest(
+    train_X: np.ndarray,
+    train_y: np.ndarray,
+    test_X: np.ndarray,
+    test_y: np.ndarray,
+) -> RFResult:
+    """Train RandomForest on labeled data and predict on test set.
+
+    Args:
+        train_X: Training feature matrix.
+        train_y: Training labels (0=normal, 1=stego).
+        test_X: Test feature matrix.
+        test_y: Test labels.
+
+    Returns:
+        RFResult with predictions and accuracy.
+    """
+    scaler = StandardScaler()
+    scaled_train = scaler.fit_transform(train_X)
+    scaled_test = scaler.transform(test_X)
+
+    clf = RandomForestClassifier(
+        n_estimators=100,
+        random_state=42,
+        max_depth=10,
+    )
+    clf.fit(scaled_train, train_y)
+
+    predictions = clf.predict(scaled_test).tolist()
+    accuracy = sum(1 for p, t in zip(predictions, test_y) if p == t) / len(test_y)
+
+    return RFResult(
+        accuracy=accuracy,
+        predictions=predictions,
+        feature_importances=clf.feature_importances_.tolist(),
+    )
